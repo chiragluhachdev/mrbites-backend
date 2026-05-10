@@ -15,6 +15,7 @@ const authRouter = require('./routes/auth');
 const restaurantsRouter = require('./routes/restaurants');
 const usersRouter = require('./routes/users');
 const paymentRouter = require('./routes/payment');
+const uploadRouter = require('./routes/upload');
 
 const app = express();
 
@@ -57,6 +58,7 @@ app.use('/api/auth', authRouter);
 app.use('/api/restaurants', restaurantsRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/payment', paymentRouter);
+app.use('/api/upload', uploadRouter);
 
 /* ------------------ HTTP SERVER + SOCKET.IO ------------------ */
 
