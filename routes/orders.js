@@ -114,4 +114,17 @@ router.get('/restaurant/:id', async (req, res) => {
   }
 });
 
+// GET all orders (for admin analytics)
+router.get('/', async (req, res) => {
+  try {
+    const orders = await Order.find()
+      .sort({ createdAt: -1 })
+      .populate('restaurantId', 'name');
+    res.json({ orders });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 module.exports = router;
