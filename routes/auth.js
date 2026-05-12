@@ -3,6 +3,8 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const mongoose = require('mongoose');
+const axios = require('axios');
+const Otp = require('../models/Otp');
 
 const router = express.Router();
 
@@ -31,7 +33,6 @@ router.post('/register', async (req, res) => {
   }
 });
 
-module.exports = router;
 
 // POST /api/auth/login
 router.post('/login', async (req, res) => {
@@ -142,3 +143,70 @@ router.get('/me', async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 });
+
+// POST /api/auth/send-otp
+router.post('/send-otp', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ message: 'Missing phone number' });
+
+    // Generate a 6-digit OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
+    // Save to database (will automatically expire after 5 mins due to TTL index)
+    await Otp.create({ phone, otp });
+
+    // Send SMS via Fast2SMS using Quick Route (q) since OTP route requires Website Verification
+    const response = await axios.post('https://www.fast2sms.com/dev/bulkV2', {
+      message: `Your MR BITES login OTP is ${otp}`,
+      route: 'q',
+      numbers: phone
+    }, {
+      headers: {
+        'authorization': process.env.FAST2SMS_API_KEY,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (response.data.return === false) {
+       console.error('Fast2SMS Error:', response.data);
+       return res.status(500).json({ message: 'Failed to send OTP' });
+    }
+
+    res.json({ message: 'OTP sent successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// POST /api/auth/verify-otp
+router.post('/verify-otp', async (req, res) => {
+  try {
+    const { phone, otp, name } = req.body;
+    if (!phone || !otp) return res.status(400).json({ message: 'Missing fields' });
+
+    // Verify OTP
+    const otpRecord = await Otp.findOne({ phone, otp });
+    if (!otpRecord) return res.status(400).json({ message: 'Invalid or expired OTP' });
+
+    // OTP is valid, delete it so it can't be reused
+    await Otp.deleteOne({ _id: otpRecord._id });
+
+    // Check if user exists
+    let user = await User.findOne({ phone });
+    if (!user) {
+      // Create new user
+      user = new User({ name: name || 'User', phone, password: 'otp-login' });
+      await user.save();
+    }
+
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
+    res.json({ token, user: { id: user._id, name: user.name, phone: user.phone } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+module.exports = router;
