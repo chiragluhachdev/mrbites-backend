@@ -77,7 +77,27 @@ router.post('/vendor-login', async (req, res) => {
     // Issue a token scoped to vendor role and restaurantId
     const token = jwt.sign({ role: 'vendor', restaurantId: restaurant._id }, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
 
-    res.json({ token, vendor: { restaurantId: restaurant._id, name: restaurant.name } });
+    res.json({ token, vendor: { restaurantId: restaurant._id, name: restaurant.name, posEnabled: !!restaurant.posEnabled } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// POST /api/auth/admin-login
+router.post('/admin-login', async (req, res) => {
+  try {
+    const { passkey } = req.body;
+    if (!passkey) return res.status(400).json({ message: 'Missing passkey' });
+
+    const hash = process.env.ADMIN_PASSKEY_HASH;
+    if (!hash) return res.status(503).json({ message: 'Admin login is not configured' });
+
+    const match = await bcrypt.compare(String(passkey), hash);
+    if (!match) return res.status(401).json({ message: 'Invalid passkey' });
+
+    const token = jwt.sign({ role: 'admin' }, process.env.JWT_SECRET || 'secret', { expiresIn: '12h' });
+    res.json({ token, admin: { role: 'admin' } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error' });
@@ -104,6 +124,12 @@ router.get('/me', async (req, res) => {
       return res.status(401).json({ message: 'Invalid token' });
     }
 
+    // Admin sessions carry no database record — the role on the token is the
+    // whole identity.
+    if (payload.role === 'admin') {
+      return res.json({ admin: { role: 'admin' }, token: null });
+    }
+
     // If token belongs to a vendor session, return vendor info
     if (payload.role === 'vendor' && payload.restaurantId) {
       const Restaurant = require('../models/Restaurant');
@@ -120,7 +146,7 @@ router.get('/me', async (req, res) => {
         newToken = jwt.sign({ role: 'vendor', restaurantId: restaurant._id }, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
       }
 
-      return res.json({ vendor: { restaurantId: restaurant._id, name: restaurant.name }, token: newToken });
+      return res.json({ vendor: { restaurantId: restaurant._id, name: restaurant.name, posEnabled: !!restaurant.posEnabled }, token: newToken });
     }
 
     // Otherwise assume a regular user token
@@ -150,10 +176,16 @@ router.post('/send-otp', async (req, res) => {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ message: 'Missing phone number' });
 
+    const phoneRegex = /^[6-9]\d{9}$/;
+    if (!phoneRegex.test(phone.trim())) {
+      return res.status(400).json({ message: 'Enter a valid 10-digit Indian mobile number' });
+    }
+
     // Generate a 6-digit OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
 
-    // Save to database (will automatically expire after 5 mins due to TTL index)
+    // Delete any existing OTPs for this phone to prevent brute-force
+    await Otp.deleteMany({ phone });
     await Otp.create({ phone, otp });
 
     // Send SMS via Fast2SMS using Quick Route (q) since OTP route requires Website Verification
@@ -196,8 +228,14 @@ router.post('/verify-otp', async (req, res) => {
     // Check if user exists
     let user = await User.findOne({ phone });
     if (!user) {
-      // Create new user
-      user = new User({ name: name || 'User', phone, password: 'otp-login' });
+      const randomPassword = await bcrypt.hash(require('crypto').randomBytes(32).toString('hex'), 10);
+      // No name when someone signs in by OTP without signing up. The app spots
+      // the blank and asks them, instead of labelling them "User" forever.
+      user = new User({ name: (name || '').trim(), phone, password: randomPassword });
+      await user.save();
+    } else if (name?.trim() && !user.name) {
+      // They signed up later with a name — fill in the blank.
+      user.name = name.trim();
       await user.save();
     }
 

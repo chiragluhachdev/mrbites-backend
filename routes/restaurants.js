@@ -3,8 +3,29 @@ const bcrypt = require('bcrypt');
 const Restaurant = require('../models/Restaurant');
 const MenuItem = require('../models/MenuItem');
 const mongoose = require('mongoose');
+const Settings = require('../models/Settings');
+const { requireVendor, requireAdmin, ownsOutlet } = require('../middleware/auth');
 
 const router = express.Router();
+
+/**
+ * An outlet is orderable only if it is open AND the platform isn't paused.
+ * Applied on the customer-facing reads only — the vendor's own settings screen
+ * still shows its real isOpen flag, so a global pause never silently rewrites
+ * what a vendor thinks they configured.
+ */
+const effectiveIsOpen = (restaurant, orderingEnabled) => orderingEnabled && restaurant.isOpen !== false;
+
+// A rating shows only when the global switch AND the outlet's own flag allow it.
+const showRating = (restaurant, ratingsEnabled) =>
+  ratingsEnabled !== false && restaurant.ratingEnabled !== false;
+
+/** 403s a vendor trying to act on an outlet that isn't theirs. */
+const guardOutlet = (req, res, restaurantId) => {
+  if (ownsOutlet(req.user, restaurantId)) return true;
+  res.status(403).json({ message: 'You can only manage your own outlet' });
+  return false;
+};
 
 // GET /api/restaurants - Get all restaurants
 router.get('/', async (req, res) => {
@@ -13,8 +34,23 @@ router.get('/', async (req, res) => {
       return res.status(503).json({ message: 'Database not connected' });
     }
 
-    const restaurants = await Restaurant.find().sort({ createdAt: -1 });
-    res.json({ restaurants });
+    const [restaurants, settings] = await Promise.all([
+      Restaurant.find().sort({ createdAt: -1 }).lean(),
+      Settings.get(),
+    ]);
+    res.json({
+      restaurants: restaurants.map((r) => ({
+        ...r,
+        isOpen: effectiveIsOpen(r, settings.orderingEnabled),
+        ratingEnabled: r.ratingEnabled !== false,
+        showRating: showRating(r, settings.ratingsEnabled),
+      })),
+      platform: {
+        orderingEnabled: settings.orderingEnabled,
+        pausedMessage: settings.pausedMessage,
+        ratingsEnabled: settings.ratingsEnabled,
+      },
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error' });
@@ -46,7 +82,6 @@ router.get('/:id', async (req, res) => {
           description: it.description,
           price: it.price,
           image: it.image,
-          isVeg: it.isVeg,
           available: it.available,
           modifiers: it.modifiers || [],
           restaurantName: it.restaurantName || restaurant.name,
@@ -63,8 +98,8 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// POST /api/restaurants - Create new restaurant (admin only - for testing)
-router.post('/', async (req, res) => {
+// POST /api/restaurants - Create a new outlet — admin only
+router.post('/', requireAdmin, async (req, res) => {
   try {
     const { name, location, image, isOpen, waitTime, description, rating, vendorPasskey } = req.body;
 
@@ -105,12 +140,15 @@ router.post('/', async (req, res) => {
   }
 });
 
-// PUT /api/restaurants/:id - Update restaurant fields (admin)
-router.put('/:id', async (req, res) => {
+// PUT /api/restaurants/:id - Update restaurant fields — vendor only
+router.put('/:id', requireVendor, async (req, res) => {
   try {
     if (mongoose.connection.readyState !== 1) return res.status(503).json({ message: 'Database not connected' });
+    if (!guardOutlet(req, res, req.params.id)) return;
 
     const updates = req.body || {};
+    // Only an admin decides a rating; a vendor cannot mark up its own.
+    if (req.user.role !== 'admin') delete updates.rating;
     // If admin sent a vendorPasskey, hash it before storing. If an empty value was sent, clear the passkey.
     if (Object.prototype.hasOwnProperty.call(updates, 'vendorPasskey')) {
       if (updates.vendorPasskey) {
@@ -127,14 +165,48 @@ router.put('/:id', async (req, res) => {
       }
     }
 
-    const opts = { new: true };
+    // Payout is a subdocument: assigning it wholesale would silently blank the
+    // fields the caller didn't send — including the account number, which is
+    // select:false and so can never be echoed back for a round trip. Flatten it
+    // into dot paths so only what was sent is written.
+    if (updates.payout && typeof updates.payout === 'object') {
+      const { payout, ...rest } = updates;
+      Object.entries(payout).forEach(([key, value]) => {
+        if (value !== undefined && value !== null) rest[`payout.${key}`] = value;
+      });
+      Object.assign(updates, rest);
+      delete updates.payout;
+    }
+
+    const opts = { new: true, runValidators: true };
     const restaurant = await Restaurant.findByIdAndUpdate(req.params.id, updates, opts).lean();
     if (!restaurant) return res.status(404).json({ message: 'Restaurant not found' });
 
-    // Emit update to sockets
+    // Cascade restaurant name to all menu items when name changes
+    if (updates.name) {
+      try {
+        await MenuItem.updateMany({ restaurant: req.params.id }, { restaurantName: updates.name });
+      } catch (cascadeErr) {
+        console.warn('Failed cascading restaurant name to menu items', cascadeErr);
+      }
+    }
+
+    // Broadcast public fields to everyone — customers browsing outlets or sitting
+    // on a menu screen see open/close and wait-time changes live. Emitted
+    // globally (not to the outlet's room) because those clients aren't in it, and
+    // sanitised so a passkey or payout change is never broadcast.
     try {
       const io = req.app.get('io');
-      if (io) io.emit('restaurant.updated', { id: restaurant._id, updates });
+      if (io) {
+        const PUBLIC = ['name', 'location', 'image', 'bannerImage', 'description', 'isOpen', 'waitTime', 'rating', 'ratingEnabled'];
+        const publicUpdates = {};
+        PUBLIC.forEach((k) => {
+          if (Object.prototype.hasOwnProperty.call(updates, k)) publicUpdates[k] = restaurant[k];
+        });
+        if (Object.keys(publicUpdates).length) {
+          io.emit('restaurant.updated', { id: String(restaurant._id), updates: publicUpdates });
+        }
+      }
     } catch (emitErr) {
       console.warn('Emit restaurant.updated failed', emitErr);
     }
@@ -174,23 +246,33 @@ router.get('/:id/menu', async (req, res) => {
         description: it.description,
         price: it.price,
         image: it.image,
-        isVeg: it.isVeg,
         available: it.available,
         modifiers: it.modifiers || [],
+        // Items carry their outlet so anything that outlives the menu screen —
+        // a favourite, a cart line — knows where it came from.
+        restaurantId: restaurant._id,
+        restaurantName: it.restaurantName || restaurant.name,
       });
     });
 
     const sections = Array.from(map.keys()).map((key) => ({ title: key, data: map.get(key) }));
+
+    const settings = await Settings.get();
 
     res.json({
       restaurant: {
         id: restaurant._id,
         name: restaurant.name,
         image: restaurant.image,
+        // The header crop, or the card image when the vendor hasn't set one.
+        banner: restaurant.bannerImage || restaurant.image,
         location: restaurant.location,
-        isOpen: restaurant.isOpen,
+        description: restaurant.description,
+        // Reads closed while the platform is paused, whatever the outlet set.
+        isOpen: effectiveIsOpen(restaurant, settings.orderingEnabled),
         waitTime: restaurant.waitTime,
         rating: restaurant.rating,
+        showRating: showRating(restaurant, settings.ratingsEnabled),
       },
       sections,
     });
@@ -200,15 +282,16 @@ router.get('/:id/menu', async (req, res) => {
   }
 });
 
-// POST /api/restaurants/:id/menu/items - Create a menu item for a restaurant
-router.post('/:id/menu/items', async (req, res) => {
+// POST /api/restaurants/:id/menu/items - Create a menu item — vendor only
+router.post('/:id/menu/items', requireVendor, async (req, res) => {
   try {
     if (mongoose.connection.readyState !== 1) return res.status(503).json({ message: 'Database not connected' });
+    if (!guardOutlet(req, res, req.params.id)) return;
 
     const restaurant = await Restaurant.findById(req.params.id);
     if (!restaurant) return res.status(404).json({ message: 'Restaurant not found' });
 
-    const { name, description, price, image, category, isVeg, available, modifiers } = req.body;
+    const { name, description, price, image, category, available, modifiers } = req.body;
     if (!name || price === undefined) return res.status(400).json({ message: 'Missing name or price' });
 
     const item = new MenuItem({
@@ -219,7 +302,6 @@ router.post('/:id/menu/items', async (req, res) => {
       price,
       image: image || '',
       category: category || 'Uncategorized',
-      isVeg: isVeg !== undefined ? isVeg : true,
       available: available !== undefined ? available : true,
       modifiers: modifiers || [],
     });
@@ -242,10 +324,15 @@ router.post('/:id/menu/items', async (req, res) => {
   }
 });
 
-// PUT /api/menu/items/:itemId - Update a menu item
-router.put('/menu/items/:itemId', async (req, res) => {
+// PUT /api/menu/items/:itemId - Update a menu item — vendor only
+router.put('/menu/items/:itemId', requireVendor, async (req, res) => {
   try {
     if (mongoose.connection.readyState !== 1) return res.status(503).json({ message: 'Database not connected' });
+
+    // Check ownership from the item's own outlet before touching it.
+    const existing = await MenuItem.findById(req.params.itemId).select('restaurant');
+    if (!existing) return res.status(404).json({ message: 'Menu item not found' });
+    if (!guardOutlet(req, res, existing.restaurant)) return;
 
     const updates = req.body || {};
     const item = await MenuItem.findByIdAndUpdate(req.params.itemId, updates, { new: true });
@@ -268,10 +355,14 @@ router.put('/menu/items/:itemId', async (req, res) => {
   }
 });
 
-// DELETE /api/menu/items/:itemId - Remove a menu item
-router.delete('/menu/items/:itemId', async (req, res) => {
+// DELETE /api/menu/items/:itemId - Remove a menu item — vendor only
+router.delete('/menu/items/:itemId', requireVendor, async (req, res) => {
   try {
     if (mongoose.connection.readyState !== 1) return res.status(503).json({ message: 'Database not connected' });
+
+    const existing = await MenuItem.findById(req.params.itemId).select('restaurant');
+    if (!existing) return res.status(404).json({ message: 'Menu item not found' });
+    if (!guardOutlet(req, res, existing.restaurant)) return;
 
     const item = await MenuItem.findByIdAndDelete(req.params.itemId);
     if (!item) return res.status(404).json({ message: 'Menu item not found' });
@@ -295,8 +386,8 @@ router.delete('/menu/items/:itemId', async (req, res) => {
   }
 });
 
-// DELETE /api/restaurants/:id - Delete a restaurant and its menu items
-router.delete('/:id', async (req, res) => {
+// DELETE /api/restaurants/:id - Delete an outlet and its menu items — admin only
+router.delete('/:id', requireAdmin, async (req, res) => {
   try {
     if (mongoose.connection.readyState !== 1) return res.status(503).json({ message: 'Database not connected' });
 

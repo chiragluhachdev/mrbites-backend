@@ -16,8 +16,18 @@ const restaurantsRouter = require('./routes/restaurants');
 const usersRouter = require('./routes/users');
 const paymentRouter = require('./routes/payment');
 const uploadRouter = require('./routes/upload');
+const financeRouter = require('./routes/finance');
+const settingsRouter = require('./routes/settings');
 
 const app = express();
+
+/* ------------------ SECURITY HEADERS ------------------ */
+try {
+  const helmet = require('helmet');
+  app.use(helmet());
+} catch {
+  // helmet not installed; run: npm install helmet
+}
 
 /* ------------------ CORS SETUP ------------------ */
 // Allow all origins (mobile app, Expo, web)
@@ -34,7 +44,7 @@ app.use(
 app.options('*', cors());
 
 /* ------------------ MIDDLEWARE ------------------ */
-app.use(express.json()); // Parse JSON bodies
+app.use(express.json({ limit: '100kb' }));
 
 /* ------------------ BASIC TEST ROUTES ------------------ */
 
@@ -59,6 +69,8 @@ app.use('/api/restaurants', restaurantsRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/payment', paymentRouter);
 app.use('/api/upload', uploadRouter);
+app.use('/api/finance', financeRouter);
+app.use('/api/settings', settingsRouter);
 
 /* ------------------ HTTP SERVER + SOCKET.IO ------------------ */
 
@@ -107,12 +119,8 @@ mongoose
     });
   })
   .catch((err) => {
-    console.error('⚠️ Mongo connection error:', err.message || err);
-
-    // Still start server even if DB fails (optional)
-    server.listen(PORT, '0.0.0.0', () => {
-      console.log(`🚀 Server running on port ${PORT} (DB error mode)`);
-    });
+    console.error('⚠️ MongoDB connection failed, exiting:', err.message || err);
+    process.exit(1);
   });
 
 module.exports = app;
