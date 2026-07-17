@@ -187,13 +187,13 @@ router.post('/send-otp', async (req, res) => {
 
       if (response.data.return === false) {
         console.error('Fast2SMS Error:', response.data);
-        // Our provider failed, not the user — drop the code so they are not
-        // held behind a cooldown for a message that never arrived.
-        await discardOtp(phone);
+        // Only drop a brand-new code. If this was a resend, an earlier SMS may
+        // already have reached them — discarding would strand a code they hold.
+        if (!issued.reused) await discardOtp(phone);
         return res.status(502).json({ message: 'Could not send the OTP right now. Please try again.' });
       }
     } catch (smsErr) {
-      await discardOtp(phone);
+      if (!issued.reused) await discardOtp(phone);
       console.error('Send OTP failed', smsErr?.message || smsErr);
       return res.status(502).json({ message: 'Could not send the OTP right now. Please try again.' });
     }

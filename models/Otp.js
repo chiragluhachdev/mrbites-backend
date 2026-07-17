@@ -9,7 +9,11 @@ const mongoose = require('mongoose');
 // also guards changing a phone number and deleting an account. Counting attempts
 // here, beside the code itself, means the limit holds whichever route checks it.
 
-const OTP_TTL_SECONDS = 300; // 5 minutes
+// A code lives for ten minutes, and the same code is re-sent on every resend in
+// that window (see utils/otp issueOtp). So a slow first SMS and a "resend" don't
+// leave the student holding two different codes, unsure which one works — there
+// is only ever one live code per number, valid for its whole lifetime.
+const OTP_TTL_SECONDS = 600; // 10 minutes
 const MAX_OTP_ATTEMPTS = 5;
 
 const otpSchema = new mongoose.Schema({

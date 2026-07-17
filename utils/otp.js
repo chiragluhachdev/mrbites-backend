@@ -63,38 +63,45 @@ const consumeOtp = async (phone, otp) => {
   return { ok: true };
 };
 
-// How long a number must wait between codes. Short enough that someone who
-// genuinely missed the SMS isn't stuck, long enough that a stuck retry loop
-// can't run up an SMS bill.
+// The shortest gap between two SMS to the same number. Only stops a double-tap
+// or an impatient hammer from firing several texts a second apart; the real
+// ceiling on total sends is the per-phone rate limit in server.js.
 const OTP_RESEND_COOLDOWN_SECONDS = 15;
 
 /**
- * Issues a fresh code, replacing any outstanding one for that number.
+ * Gets a code to send to this number.
  *
- * Enforced here rather than in the app: a countdown on a button is a courtesy,
- * not a control — anyone can call the endpoint directly. The server owns the
- * clock and simply reports how long is left, which the app then counts down.
+ * If one is already live, that same code is returned — a resend re-sends what
+ * was first issued rather than minting a new one, so the earlier SMS never stops
+ * working and the student is never left guessing which code is current. A brand
+ * new code is only created when none is outstanding.
  *
- * Keyed on the number, never the caller's address. Every student on campus
- * shares one WiFi and therefore one public IP, so a per-IP cooldown would mean
- * one person's resend blocking everyone else's sign-in.
+ * A short per-number cooldown throttles back-to-back sends (a double-tap), and
+ * reports how many seconds remain so the app can count down. It is keyed on the
+ * number, never the caller's IP: a campus shares one address, so a per-IP
+ * cooldown would let one person's resend block everyone else's sign-in.
  *
- * @returns {Promise<{ok:true, otp:string, retryAfter:number} | {ok:false, retryAfter:number}>}
+ * @returns {Promise<
+ *   {ok:true, otp:string, retryAfter:number, reused:boolean} |
+ *   {ok:false, retryAfter:number}
+ * >}
  */
 const issueOtp = async (phone) => {
   const normalized = String(phone).trim();
 
-  const existing = await Otp.findOne({ phone: normalized }).select('createdAt').lean();
-  if (existing?.createdAt) {
+  const existing = await Otp.findOne({ phone: normalized }).select('otp createdAt').lean();
+  if (existing?.otp) {
     const elapsedMs = Date.now() - new Date(existing.createdAt).getTime();
     const remaining = Math.ceil((OTP_RESEND_COOLDOWN_SECONDS * 1000 - elapsedMs) / 1000);
     if (remaining > 0) return { ok: false, retryAfter: remaining };
+    // Past the cooldown: resend the SAME code. createdAt is left untouched, so
+    // the ten-minute lifetime still runs from when it was first issued.
+    return { ok: true, otp: existing.otp, retryAfter: OTP_RESEND_COOLDOWN_SECONDS, reused: true };
   }
 
   const otp = generateOtp();
-  await Otp.deleteMany({ phone: normalized });
   await Otp.create({ phone: normalized, otp, attempts: 0 });
-  return { ok: true, otp, retryAfter: OTP_RESEND_COOLDOWN_SECONDS };
+  return { ok: true, otp, retryAfter: OTP_RESEND_COOLDOWN_SECONDS, reused: false };
 };
 
 /**

@@ -74,7 +74,9 @@ router.post('/create-order', authenticate, perUserPaymentLimiter, async (req, re
     await OrderDraft.create({
       razorpayOrderId: rzpOrder.id,
       userId: user._id,
-      customer: { name: user.name || '', phone: user.phone },
+      // A student who never set a name still needs something on the ticket the
+      // counter reads out, so it falls back to "User" rather than a blank.
+      customer: { name: user.name?.trim() || 'User', phone: user.phone },
       groups: priced.groups,
       total: priced.total,
       pickupType: pickupType === 'PICK_UP' ? 'PICK_UP' : 'DINE_IN',
