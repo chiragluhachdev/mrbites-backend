@@ -7,6 +7,7 @@ const User = require('../models/User');
 const Settings = require('../models/Settings');
 const { authenticate, requireVendor, requireAdmin, ownsOutlet } = require('../middleware/auth');
 const { priceOrder } = require('../utils/pricing');
+const { priceCart } = require('../utils/priceCart');
 const { razorpay, verifySignature } = require('../utils/razorpay');
 
 const VALID_STATUSES = ['pending', 'preparing', 'ready', 'delivered', 'cancelled'];
@@ -296,6 +297,63 @@ router.post('/confirm', authenticate, async (req, res) => {
   }
 });
 
+// POST /api/orders/demo — a no-payment order, for demo mode and store review.
+//
+// Same cart, same server-side pricing, same validation as a real order — so the
+// flow a reviewer walks is genuinely the app's flow — but no Razorpay, no money,
+// and an isDemo stamp that keeps it out of every view except the customer's own
+// history. Allowed only when the platform is in demo mode, or for the review
+// account; a normal user in normal operation gets a 403 and the real flow.
+router.post('/demo', authenticate, async (req, res) => {
+  try {
+    const [settings, user] = await Promise.all([
+      Settings.get(),
+      User.findById(req.user.id).select('name phone isDemo').lean(),
+    ]);
+    if (!user) return res.status(401).json({ message: 'Please sign in again.' });
+
+    if (!settings.demoMode && !user.isDemo) {
+      // Not a demo context — the client should be using the real payment flow.
+      return res.status(403).json({ message: 'Demo checkout is not available right now.' });
+    }
+
+    const priced = await priceCart(req.body?.items);
+    if (!priced.ok) {
+      return res.status(409).json({ reason: priced.reason, message: priced.message });
+    }
+
+    const now = new Date();
+    const customer = { name: user.name?.trim() || 'User', phone: user.phone };
+    const docs = priced.groups.map((g) => ({
+      restaurantId: g.restaurantId,
+      items: g.items,
+      subtotal: g.subtotal,
+      total: g.total,
+      source: 'ONLINE',
+      isDemo: true, // the flag that keeps this out of vendor/admin/finance
+      pickupType: req.body?.pickupType === 'PICK_UP' ? 'PICK_UP' : 'DINE_IN',
+      notes: req.body?.notes,
+      customer,
+      paidAt: now,
+      // Settled with no obligation, belt-and-braces alongside the isDemo filters,
+      // so a demo order can never read as money owed even if a filter is missed.
+      settlementStatus: 'settled',
+      settledAt: now,
+      status: 'pending',
+    }));
+
+    // Deliberately NOT broadcast to the vendor room — a demo order is never a
+    // real ticket to cook.
+    const orders = await Order.insertMany(docs);
+    const populated = await Order.find({ _id: { $in: orders.map((o) => o._id) } }).populate('restaurantId', 'name');
+
+    res.status(201).json({ orders: populated, demo: true });
+  } catch (err) {
+    console.error('Demo order failed', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // POST /api/orders/pos — a counter sale rung up by the vendor.
 //
 // Separate from online orders in every way: the vendor collected the money
@@ -383,7 +441,8 @@ router.get('/restaurant/:id', requireVendor, async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
     const skip = (page - 1) * limit;
-    const filter = { restaurantId: req.params.id };
+    // Demo orders never reach a vendor — they are not real tickets.
+    const filter = { restaurantId: req.params.id, isDemo: { $ne: true } };
     if (req.query.status && VALID_STATUSES.includes(req.query.status)) {
       filter.status = req.query.status;
     }
@@ -406,7 +465,8 @@ router.get('/restaurant/:id', requireVendor, async (req, res) => {
 // GET all orders across every outlet, with customer details — admin only.
 router.get('/', requireAdmin, async (req, res) => {
   try {
-    const orders = await Order.find()
+    // Demo orders are excluded here too — the admin console reflects real trade.
+    const orders = await Order.find({ isDemo: { $ne: true } })
       .sort({ createdAt: -1 })
       .populate('restaurantId', 'name');
     res.json({ orders });

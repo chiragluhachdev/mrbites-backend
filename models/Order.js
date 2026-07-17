@@ -36,6 +36,12 @@ const OrderSchema = new mongoose.Schema({
   //            vendor (cash/UPI/card/other). The platform never holds this
   //            money, so it carries no settlement obligation.
   source: { type: String, enum: ['ONLINE', 'POS'], default: 'ONLINE' },
+  // A demo/review order: created without payment while demo mode is on (or by
+  // the demo account). It shows in the customer's own history, marked, and is
+  // deliberately kept out of every other view — vendor dashboards, admin, and
+  // all finance/settlement figures filter it out — so it can never be mistaken
+  // for real money or a real order to cook.
+  isDemo: { type: Boolean, default: false },
   // How a POS sale was paid. Meaningless for ONLINE (always Razorpay).
   posPaymentMethod: { type: String, enum: ['cash', 'upi', 'card', 'other'] },
 

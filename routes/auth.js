@@ -6,6 +6,7 @@ const axios = require('axios');
 const User = require('../models/User');
 const { JWT_SECRET } = require('../utils/secrets');
 const { issueOtp, consumeOtp, discardOtp } = require('../utils/otp');
+const { DEMO_LOGIN_OTP, DEMO_NAME, isDemoPhone } = require('../utils/demo');
 
 const router = express.Router();
 
@@ -159,6 +160,12 @@ router.post('/send-otp', async (req, res) => {
       return res.status(400).json({ message: 'Enter a valid 10-digit Indian mobile number' });
     }
 
+    // The review account never gets a real text — its code is fixed. Answer as
+    // if one was sent so the reviewer's flow is identical to a real user's.
+    if (isDemoPhone(phone)) {
+      return res.json({ message: 'OTP sent successfully', retryAfter: 15 });
+    }
+
     const issued = await issueOtp(phone);
     if (!issued.ok) {
       // Still inside the cooldown. `retryAfter` drives the countdown in the app.
@@ -213,8 +220,18 @@ router.post('/verify-otp', async (req, res) => {
     const { otp, name } = req.body || {};
     if (!phone) return res.status(400).json({ message: 'Enter a valid 10-digit Indian mobile number' });
 
-    const check = await consumeOtp(phone, otp);
-    if (!check.ok) return res.status(400).json({ message: check.message });
+    const demo = isDemoPhone(phone);
+    if (demo) {
+      // The review account checks against its fixed code, never the OTP store —
+      // there is no SMS behind it. Constant-time compare so it leaks nothing.
+      const a = Buffer.from(String(otp || ''));
+      const b = Buffer.from(DEMO_LOGIN_OTP);
+      const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
+      if (!ok) return res.status(400).json({ message: 'Incorrect code.' });
+    } else {
+      const check = await consumeOtp(phone, otp);
+      if (!check.ok) return res.status(400).json({ message: check.message });
+    }
 
     let user = await User.findOne({ phone });
     if (!user) {
@@ -224,16 +241,23 @@ router.post('/verify-otp', async (req, res) => {
       const randomPassword = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 10);
       // No name when someone signs in by OTP without signing up. The app spots
       // the blank and asks them, instead of labelling them "User" forever.
-      user = new User({ name: (name || '').trim(), phone, password: randomPassword });
+      user = new User({
+        name: demo ? DEMO_NAME : (name || '').trim(),
+        phone,
+        password: randomPassword,
+        isDemo: demo,
+      });
       await user.save();
-    } else if (name?.trim() && !user.name) {
-      // They signed up later with a name — fill in the blank.
-      user.name = name.trim();
-      await user.save();
+    } else {
+      // Keep the demo flag in step even for a pre-existing record, and fill a
+      // blank name when they finally give one.
+      if (demo && !user.isDemo) user.isDemo = true;
+      if (name?.trim() && !user.name) user.name = name.trim();
+      if (user.isModified()) await user.save();
     }
 
     const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, user: { id: user._id, name: user.name, phone: user.phone } });
+    res.json({ token, user: { id: user._id, name: user.name, phone: user.phone, isDemo: !!user.isDemo } });
   } catch (err) {
     console.error('Verify OTP failed', err);
     res.status(500).json({ message: 'Server error' });

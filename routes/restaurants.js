@@ -91,6 +91,7 @@ router.get('/', async (req, res) => {
         orderingEnabled: settings.orderingEnabled,
         pausedMessage: settings.pausedMessage,
         ratingsEnabled: settings.ratingsEnabled,
+        demoMode: !!settings.demoMode,
       },
     });
   } catch (err) {

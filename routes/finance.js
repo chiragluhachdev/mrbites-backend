@@ -20,8 +20,10 @@ const router = express.Router();
 // Settlement is an ONLINE-only concern: POS money was paid straight to the
 // vendor and the platform never held it, so it can never be "owed". `$ne: 'POS'`
 // also sweeps in legacy orders saved before the source field existed.
-const EARNING = { status: { $ne: 'cancelled' }, source: { $ne: 'POS' } };
-const POS_EARNING = { status: { $ne: 'cancelled' }, source: 'POS' };
+// `isDemo: { $ne: true }` on both: a demo/review order carries no real money, so
+// it must never appear in a collection total, a payout figure or a settlement.
+const EARNING = { status: { $ne: 'cancelled' }, source: { $ne: 'POS' }, isDemo: { $ne: true } };
+const POS_EARNING = { status: { $ne: 'cancelled' }, source: 'POS', isDemo: { $ne: true } };
 
 // Days are IST days, not the server's.
 //

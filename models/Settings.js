@@ -15,6 +15,13 @@ const SettingsSchema = new mongoose.Schema({
   // Master switch for outlet ratings. When false, no outlet shows a rating,
   // whatever its own ratingEnabled flag says.
   ratingsEnabled: { type: Boolean, default: true },
+
+  // Demo mode. When on, checkout takes no money: the app shows a confirmation,
+  // a marked demo order lands in the customer's history, and nothing reaches
+  // Razorpay, the vendor dashboards or the finance figures. Meant for app-store
+  // review and staged demos, so reviewers can walk the whole flow without a real
+  // card. Off by default; a normal launch never touches it.
+  demoMode: { type: Boolean, default: false },
 }, { timestamps: true });
 
 /** Reads the singleton, creating it the first time. */

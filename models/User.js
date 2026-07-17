@@ -8,6 +8,10 @@ const UserSchema = new mongoose.Schema({
   password: { type: String, required: true },
   // Expo push token for this user (optional)
   pushToken: { type: String },
+  // The app-store review account. Checkout is always demo for this user, even
+  // when the global demo switch is off, so a reviewer can complete the flow at
+  // any time without a real card and without an admin having to flip anything.
+  isDemo: { type: Boolean, default: false },
 }, { timestamps: true });
 
 module.exports = mongoose.model('User', UserSchema);
