@@ -1,8 +1,8 @@
 const express = require('express');
 const User = require('../models/User');
-const Otp = require('../models/Otp');
 const Order = require('../models/Order');
 const { authenticate, requireAdmin } = require('../middleware/auth');
+const { consumeOtp } = require('../utils/otp');
 
 const router = express.Router();
 
@@ -47,9 +47,11 @@ router.patch('/me/phone', authenticate, async (req, res) => {
     }
     if (!otp) return res.status(400).json({ message: 'Enter the OTP sent to the new number' });
 
-    // Prove the caller controls the new number.
-    const record = await Otp.findOne({ phone: newPhone, otp: String(otp) });
-    if (!record) return res.status(400).json({ message: 'Invalid or expired OTP' });
+    // Prove the caller controls the new number. Goes through the shared verifier
+    // so the attempt ceiling applies here exactly as it does at sign-in —
+    // otherwise this route would be an unguarded way to brute-force a number.
+    const check = await consumeOtp(newPhone, otp);
+    if (!check.ok) return res.status(400).json({ message: check.message });
 
     // Never let two accounts share a number.
     const clash = await User.findOne({ phone: newPhone, _id: { $ne: req.user.id } });
@@ -59,7 +61,6 @@ router.patch('/me/phone', authenticate, async (req, res) => {
     if (!user) return res.status(404).json({ message: 'User not found' });
 
     const oldPhone = user.phone;
-    await Otp.deleteOne({ _id: record._id });
 
     if (oldPhone !== newPhone) {
       user.phone = newPhone;
@@ -93,11 +94,11 @@ router.delete('/me', authenticate, async (req, res) => {
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    // The code must have been sent to this account's own number.
-    const record = await Otp.findOne({ phone: user.phone, otp: String(otp) });
-    if (!record) return res.status(400).json({ message: 'Invalid or expired OTP' });
+    // The code must have been sent to this account's own number. Shared verifier,
+    // so the attempt ceiling covers account deletion too.
+    const check = await consumeOtp(user.phone, otp);
+    if (!check.ok) return res.status(400).json({ message: check.message });
 
-    await Otp.deleteOne({ _id: record._id });
     await User.deleteOne({ _id: user._id });
     // Orders are intentionally not touched — see note above.
 
@@ -108,13 +109,22 @@ router.delete('/me', authenticate, async (req, res) => {
   }
 });
 
-// POST /api/users/push-token
-// body: { phone, token }
-router.post('/push-token', async (req, res) => {
+// POST /api/users/push-token — register this device for the signed-in account.
+//
+// The number is taken from the token, never the body. Previously the body named
+// the account, unauthenticated: anyone could point a stranger's notifications at
+// their own device, and the 404-vs-200 answer told them which numbers existed.
+router.post('/push-token', authenticate, async (req, res) => {
   try {
-    const { phone, token } = req.body;
-    if (!phone || !token) return res.status(400).json({ message: 'Missing phone or token' });
-    const user = await User.findOneAndUpdate({ phone }, { pushToken: token }, { new: true, upsert: false }).select('-password');
+    const { token } = req.body || {};
+    if (!token || typeof token !== 'string') return res.status(400).json({ message: 'Missing token' });
+
+    const user = await User.findByIdAndUpdate(
+      req.user.id,
+      { pushToken: token },
+      { new: true }
+    ).select('-password -pushToken');
+
     if (!user) return res.status(404).json({ message: 'User not found' });
     res.json({ user });
   } catch (err) {
@@ -134,8 +144,24 @@ router.get('/', requireAdmin, async (req, res) => {
   }
 });
 
-// GET /api/users/:id - single user
-router.get('/:id', async (req, res) => {
+// GET /api/users/me — the signed-in user's own profile.
+router.get('/me', authenticate, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).select('-password -pushToken');
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    res.json({ user });
+  } catch (err) {
+    console.error('Failed to fetch user', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// GET /api/users/:id — admin only.
+//
+// This was open to the internet: any id returned that person's name, phone and
+// push token. Ids are guessable enough in bulk that it amounted to publishing
+// the user table. Nothing in the app called it; the admin console does.
+router.get('/:id', requireAdmin, async (req, res) => {
   try {
     const user = await User.findById(req.params.id).select('-password');
     if (!user) return res.status(404).json({ message: 'User not found' });

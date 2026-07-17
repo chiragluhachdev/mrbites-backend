@@ -1,60 +1,97 @@
 const express = require('express');
-const crypto = require('crypto');
-const Razorpay = require('razorpay');
+const rateLimit = require('express-rate-limit');
+
+const User = require('../models/User');
+const OrderDraft = require('../models/OrderDraft');
+const { authenticate } = require('../middleware/auth');
+const { priceCart } = require('../utils/priceCart');
+const { razorpay, isConfigured, key_id } = require('../utils/razorpay');
 
 const router = express.Router();
 
-// Ensure these are set in your .env: RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET
-const key_id = process.env.RAZORPAY_KEY_ID;
-const key_secret = process.env.RAZORPAY_KEY_SECRET;
-
-const razorpay = new Razorpay({ key_id: key_id, key_secret: key_secret });
-
-// Create an order on Razorpay
-router.post('/create-order', async (req, res) => {
-  try {
-    const { amount, currency = 'INR', receipt } = req.body;
-    if (!amount) return res.status(400).json({ message: 'Amount is required' });
-
-    // Razorpay expects amount in the smallest currency unit (paise)
-    const options = {
-      amount: Math.round(Number(amount) * 100),
-      currency,
-      receipt: receipt || `rcpt_${Date.now()}`,
-      payment_capture: 1,
-    };
-
-    const order = await razorpay.orders.create(options);
-
-    return res.json({ order, key: key_id });
-  } catch (err) {
-    console.error('Create order error', err);
-    return res.status(500).json({ message: 'Could not create order', error: err.message || err });
-  }
+// Keyed by user, and mounted *after* authenticate so req.user exists.
+//
+// The whole campus shares one NAT'd address, so an IP-keyed limit here would
+// have meant the thirtieth order of a lunch rush failing for everyone —
+// throttling the customers instead of an abuser. A person opening 20 payment
+// attempts in 10 minutes is already well beyond normal use.
+const perUserPaymentLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `user:${req.user?.id}`,
+  message: { message: 'Too many payment attempts. Please wait a moment and try again.' },
 });
 
-// Verify payment signature
-router.post('/verify-payment', async (req, res) => {
+// How long a quote stands. Long enough to finish paying, short enough that a
+// stale price can't be redeemed much later.
+const DRAFT_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * POST /api/payment/create-order
+ *
+ * Quotes a cart and opens a Razorpay order for it.
+ *
+ * The client sends what it wants — item ids, quantities, chosen option names —
+ * and nothing about money. The server prices it from the database, validates it
+ * (platform open, outlets open, items in stock, modifier rules satisfied), and
+ * charges *its own* total. The priced cart is stored against the Razorpay order
+ * id so that confirmation can build the orders from it rather than from
+ * whatever the client sends back.
+ *
+ * This is also the only validation gate the checkout needs: an invalid cart is
+ * rejected here, before the payment sheet ever opens, so the customer is never
+ * charged for an order that cannot be placed.
+ */
+router.post('/create-order', authenticate, perUserPaymentLimiter, async (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-      return res.status(400).json({ verified: false, message: 'Missing required fields' });
+    if (!isConfigured()) {
+      return res.status(503).json({ message: 'Payments are not configured right now.' });
     }
 
-    const hmac = crypto.createHmac('sha256', key_secret);
-    hmac.update(razorpay_order_id + '|' + razorpay_payment_id);
-    const generated_signature = hmac.digest('hex');
+    const { items, pickupType, notes } = req.body || {};
 
-    const verified = generated_signature === razorpay_signature;
-
-    if (verified) {
-      return res.json({ verified: true });
+    const priced = await priceCart(items);
+    if (!priced.ok) {
+      // 409: the cart is at odds with the live menu — the app shows `message`
+      // and refreshes. Deliberately not a 400; nothing is malformed, the world
+      // simply moved on.
+      return res.status(409).json({ reason: priced.reason, message: priced.message });
     }
 
-    return res.status(400).json({ verified: false, message: 'Signature mismatch' });
+    const user = await User.findById(req.user.id).select('name phone').lean();
+    if (!user) return res.status(401).json({ message: 'Please sign in again.' });
+
+    const rzpOrder = await razorpay.orders.create({
+      amount: Math.round(priced.total * 100), // paise, from the server's total
+      currency: 'INR',
+      receipt: `mrb_${Date.now()}_${String(user._id).slice(-6)}`,
+      payment_capture: 1,
+      notes: { userId: String(user._id) },
+    });
+
+    await OrderDraft.create({
+      razorpayOrderId: rzpOrder.id,
+      userId: user._id,
+      customer: { name: user.name || '', phone: user.phone },
+      groups: priced.groups,
+      total: priced.total,
+      pickupType: pickupType === 'PICK_UP' ? 'PICK_UP' : 'DINE_IN',
+      notes,
+      expiresAt: new Date(Date.now() + DRAFT_TTL_MS),
+    });
+
+    res.json({
+      order: { id: rzpOrder.id, amount: rzpOrder.amount, currency: rzpOrder.currency },
+      key: key_id,
+      // Echoed so the app can show the authoritative total before paying, and
+      // spot a drift from what it had on screen.
+      total: priced.total,
+    });
   } catch (err) {
-    console.error('Verify payment error', err);
-    return res.status(500).json({ verified: false, message: err.message || err });
+    console.error('Create payment order failed', err);
+    res.status(500).json({ message: 'Could not start the payment. Please try again.' });
   }
 });
 

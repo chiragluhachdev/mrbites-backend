@@ -1,33 +1,29 @@
 const express = require('express');
 const router = express.Router();
 const Order = require('../models/Order');
+const OrderDraft = require('../models/OrderDraft');
 const Restaurant = require('../models/Restaurant');
 const User = require('../models/User');
 const Settings = require('../models/Settings');
 const { authenticate, requireVendor, requireAdmin, ownsOutlet } = require('../middleware/auth');
 const { priceOrder } = require('../utils/pricing');
-const crypto = require('crypto');
+const { razorpay, verifySignature } = require('../utils/razorpay');
 
 const VALID_STATUSES = ['pending', 'preparing', 'ready', 'delivered', 'cancelled'];
 
-/**
- * Recomputes Razorpay's HMAC over order_id|payment_id. Returns true only when
- * the client's signature matches, which is the only proof the money moved.
- */
-const verifyRazorpaySignature = (payment) => {
-  if (!payment?.razorpay_order_id || !payment?.razorpay_payment_id || !payment?.razorpay_signature) {
-    return false;
-  }
-  const secret = process.env.RAZORPAY_KEY_SECRET;
-  if (!secret) return false;
-  const expected = crypto
-    .createHmac('sha256', secret)
-    .update(`${payment.razorpay_order_id}|${payment.razorpay_payment_id}`)
-    .digest('hex');
-  // Constant-time compare; lengths must match or timingSafeEqual throws.
-  const a = Buffer.from(expected);
-  const b = Buffer.from(String(payment.razorpay_signature));
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+// An order only ever moves forwards.
+//
+// Any status could previously be set from any other, so a delivered order could
+// be dragged back to pending — by a stale tab replaying an old click, or by two
+// devices in a kitchen disagreeing. That corrupts the vendor's queue and, since
+// cancelled orders are excluded from earnings, un-cancelling one silently
+// changes what the platform owes. Terminal states have no exits.
+const STATUS_TRANSITIONS = {
+  pending: ['preparing', 'ready', 'cancelled'],
+  preparing: ['ready', 'cancelled'],
+  ready: ['delivered', 'cancelled'],
+  delivered: [],
+  cancelled: [],
 };
 
 // PATCH /api/orders/:id/status — vendor only
@@ -40,14 +36,37 @@ router.patch('/:id/status', requireVendor, async (req, res) => {
     }
 
     // A vendor may only move its own outlet's orders.
-    const existing = await Order.findById(req.params.id).select('restaurantId');
+    const existing = await Order.findById(req.params.id).select('restaurantId status');
     if (!existing) return res.status(404).json({ message: 'Order not found' });
     if (!ownsOutlet(req.user, existing.restaurantId)) {
       return res.status(403).json({ message: 'You can only manage your own orders' });
     }
 
-    const order = await Order.findByIdAndUpdate(req.params.id, { status }, { new: true });
-    if (!order) return res.status(404).json({ message: 'Order not found' });
+    // Setting a status it already holds is a no-op, not an error — two taps on
+    // "Ready" should not look like a failure to the vendor.
+    if (existing.status === status) {
+      const unchanged = await Order.findById(req.params.id);
+      return res.json({ order: unchanged });
+    }
+
+    const allowed = STATUS_TRANSITIONS[existing.status] || [];
+    if (!allowed.includes(status)) {
+      return res.status(409).json({
+        message: `An order that is ${existing.status} cannot be marked ${status}.`,
+      });
+    }
+
+    // Conditional on the status we just read: if another device moved this order
+    // in between, that update is not overwritten — it loses the race cleanly
+    // rather than silently clobbering.
+    const order = await Order.findOneAndUpdate(
+      { _id: req.params.id, status: existing.status },
+      { status },
+      { new: true }
+    );
+    if (!order) {
+      return res.status(409).json({ message: 'That order was just updated elsewhere. Refresh and try again.' });
+    }
 
     // Emit status change to restaurant room
     try {
@@ -115,73 +134,165 @@ router.post('/validate', async (req, res) => {
   }
 });
 
-// POST /api/orders
-router.post('/', async (req, res) => {
+// POST /api/orders — retired.
+//
+// This route used to build orders from client-supplied items and prices, with a
+// signature that proved only that *some* payment existed. It is replaced by
+// /api/payment/create-order + /api/orders/confirm, which price the cart on the
+// server and bind the payment to it. Kept as an explicit 410 so an older app
+// build fails loudly with something a user can act on, rather than silently.
+router.post('/', (req, res) => {
+  res.status(410).json({ message: 'Please update the app to place orders.' });
+});
+
+/**
+ * Sends the sanitised order payload to the outlet's live dashboard. Tolerates a
+ * populated or raw restaurantId — the room name must be the id either way.
+ */
+const emitOrderCreated = (io, order) => {
+  if (!io) return;
   try {
-    const io = req.app.get('io');
-    const { restaurantId, items, pickupType, scheduledAt, notes, customer, payment } = req.body;
-    if (!restaurantId || !items || !items.length) return res.status(400).json({ message: 'Missing order data' });
-
-    // Orders are prepaid: no verified payment, no order. The client claiming
-    // "it went through" is not evidence — the signature is recomputed here.
-    if (!verifyRazorpaySignature(payment)) {
-      return res.status(400).json({ message: 'Payment could not be verified' });
-    }
-
-    // Never trust client totals — price the order from its line items here.
-    const { subtotal, total } = priceOrder(items);
-
-    const order = new Order({
+    const restaurantId = order.restaurantId?._id || order.restaurantId;
+    io.to(`restaurant:${restaurantId}`).emit('order.created', {
+      _id: order._id,
+      orderId: order._id,
       restaurantId,
-      items,
-      subtotal,
-      total,
-      pickupType,
-      scheduledAt,
-      notes,
-      customer,
-      paidAt: new Date(),
-      razorpayOrderId: payment.razorpay_order_id,
-      razorpayPaymentId: payment.razorpay_payment_id,
-      status: 'pending',
+      restaurantName: order.restaurantId?.name,
+      items: order.items,
+      subtotal: order.subtotal,
+      total: order.total,
+      customer: order.customer,
+      createdAt: order.createdAt,
+      status: order.status,
+      source: order.source, // ONLINE — the live panel filters on this
     });
-
-    await order.save();
-
-    // Populate restaurantId (only name) so client receives the name instead of raw id
-    try {
-      await order.populate('restaurantId', 'name');
-    } catch (popErr) {
-      console.warn('Populate restaurant name failed', popErr);
-    }
-
-    // Emit to restaurant channel if io available — include full order object
-    try {
-      if (io) {
-        io.to(`restaurant:${restaurantId}`).emit('order.created', {
-          _id: order._id,
-          orderId: order._id,
-          restaurantId: order.restaurantId._id,
-          restaurantName: order.restaurantId?.name,
-          items: order.items,
-          subtotal: order.subtotal,
-          total: order.total,
-          customer: order.customer,
-          createdAt: order.createdAt,
-          status: order.status,
-          source: order.source, // ONLINE — the live panel filters on this
-        });
-      }
-    } catch (emitErr) {
-      console.error('Emit error', emitErr);
-    }
-
-    // Notifications removed
-
-    res.status(201).json({ order });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
+    console.warn('Emit order.created failed', err);
+  }
+};
+
+/**
+ * POST /api/orders/confirm — turns a paid draft into real orders.
+ *
+ * The client sends only Razorpay's three callback fields. Everything the orders
+ * are built from — items, prices, outlets, the customer — comes from the draft
+ * stored when the payment was opened, so what is charged and what is cooked can
+ * never disagree.
+ *
+ * Three independent guards make this safe to call repeatedly, which matters
+ * because the app retries it after a dropped connection:
+ *   1. the draft's `consuming` claim, so two in-flight calls can't both proceed;
+ *   2. a `consumed` draft short-circuits and returns the orders it already made;
+ *   3. a unique (razorpayOrderId, restaurantId) index, which stops a duplicate
+ *      at the database even if the first two are somehow bypassed.
+ */
+router.post('/confirm', authenticate, async (req, res) => {
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+
+  try {
+    // 1. Is this really from Razorpay?
+    if (!verifySignature({ razorpay_order_id, razorpay_payment_id, razorpay_signature })) {
+      return res.status(400).json({ message: 'Payment could not be verified.' });
+    }
+
+    // 2. What was quoted, and is it this user's?
+    const draft = await OrderDraft.findOne({ razorpayOrderId: razorpay_order_id });
+    if (!draft) {
+      return res.status(404).json({ message: 'We could not find this payment. Contact support if you were charged.' });
+    }
+    if (String(draft.userId) !== String(req.user.id)) {
+      return res.status(403).json({ message: 'This payment belongs to another account.' });
+    }
+
+    // 3. Already done? Hand back the same orders — never make more.
+    if (draft.status === 'consumed') {
+      const orders = await Order.find({ _id: { $in: draft.orderIds } }).populate('restaurantId', 'name');
+      return res.json({ orders, idempotent: true });
+    }
+
+    // 4. Did the money actually arrive, and was it the right amount? The
+    //    signature alone proves neither.
+    const payment = await razorpay.payments.fetch(razorpay_payment_id);
+    if (!payment || payment.order_id !== razorpay_order_id) {
+      return res.status(400).json({ message: 'Payment could not be verified.' });
+    }
+    if (payment.status !== 'captured' && payment.status !== 'authorized') {
+      return res.status(402).json({ message: 'Payment has not completed. Nothing was ordered.' });
+    }
+    const expectedPaise = Math.round(draft.total * 100);
+    if (Number(payment.amount) !== expectedPaise) {
+      console.error('Payment amount mismatch', { razorpay_order_id, paid: payment.amount, expected: expectedPaise });
+      return res.status(400).json({ message: 'Payment amount did not match the order.' });
+    }
+
+    // 5. Claim the draft. Only one request wins this.
+    const claimed = await OrderDraft.findOneAndUpdate(
+      { razorpayOrderId: razorpay_order_id, status: 'awaiting_payment' },
+      { status: 'consuming' },
+      { new: true }
+    );
+    if (!claimed) {
+      // Another call is mid-flight, or just finished.
+      const fresh = await OrderDraft.findOne({ razorpayOrderId: razorpay_order_id });
+      if (fresh?.status === 'consumed') {
+        const orders = await Order.find({ _id: { $in: fresh.orderIds } }).populate('restaurantId', 'name');
+        return res.json({ orders, idempotent: true });
+      }
+      return res.status(409).json({ message: 'This order is already being placed. Please wait a moment.' });
+    }
+
+    // 6. Build one order per outlet, entirely from the draft.
+    const paidAt = new Date();
+    const docs = claimed.groups.map((g) => ({
+      restaurantId: g.restaurantId,
+      items: g.items,
+      subtotal: g.subtotal,
+      total: g.total,
+      source: 'ONLINE',
+      pickupType: claimed.pickupType,
+      notes: claimed.notes,
+      customer: claimed.customer,
+      paidAt,
+      razorpayOrderId: razorpay_order_id,
+      razorpayPaymentId: razorpay_payment_id,
+      settlementStatus: 'pending',
+      status: 'pending',
+    }));
+
+    try {
+      await Order.insertMany(docs, { ordered: false });
+    } catch (err) {
+      // A duplicate key here means a racing call already created them, which is
+      // exactly what the index is for — read them back rather than failing.
+      const duplicate = err?.code === 11000 || err?.writeErrors?.some((e) => e.err?.code === 11000);
+      if (!duplicate) {
+        // Release the claim so a retry can pick it up.
+        await OrderDraft.updateOne({ _id: claimed._id }, { status: 'awaiting_payment' });
+        throw err;
+      }
+    }
+
+    const orders = await Order.find({ razorpayOrderId: razorpay_order_id }).populate('restaurantId', 'name');
+
+    // 7. Seal the draft, and keep it around long enough to answer a late retry.
+    await OrderDraft.updateOne(
+      { _id: claimed._id },
+      {
+        status: 'consumed',
+        orderIds: orders.map((o) => o._id),
+        razorpayPaymentId: razorpay_payment_id,
+        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      }
+    );
+
+    // 8. Only now does the vendor learn of it — payment is fully verified.
+    const io = req.app.get('io');
+    orders.forEach((o) => emitOrderCreated(io, o));
+
+    res.status(201).json({ orders });
+  } catch (err) {
+    console.error('Confirm order failed', { razorpay_order_id, err });
+    res.status(500).json({ message: 'We could not place your order. If you were charged, it will be retried automatically.' });
   }
 });
 
@@ -236,18 +347,31 @@ router.post('/pos', requireVendor, async (req, res) => {
   }
 });
 
-// GET orders by customer phone
-router.get('/user/:phone', async (req, res) => {
+// GET /api/orders/mine — the signed-in customer's own order history.
+//
+// Scoped to the token's own phone number. The phone is never taken from the URL:
+// this route previously accepted any number, so anyone could read a stranger's
+// entire order history simply by guessing it.
+router.get('/mine', authenticate, async (req, res) => {
   try {
-    // Populate restaurantId to include restaurant name for client dislay
-    const orders = await Order.find({ 'customer.phone': req.params.phone })
+    const user = await User.findById(req.user.id).select('phone').lean();
+    if (!user) return res.status(401).json({ message: 'Please sign in again.' });
+
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
+    const orders = await Order.find({ 'customer.phone': user.phone })
       .sort({ createdAt: -1 })
+      .limit(limit)
       .populate('restaurantId', 'name');
     res.json({ orders });
   } catch (err) {
-    console.error(err);
+    console.error('Fetch own orders failed', err);
     res.status(500).json({ message: 'Server error' });
   }
+});
+
+// Retired: this leaked any customer's history to anyone who knew their number.
+router.get('/user/:phone', (req, res) => {
+  res.status(410).json({ message: 'Please update the app.' });
 });
 
 // GET orders for restaurant (vendor) - paginated — vendor only

@@ -9,12 +9,16 @@ const { requireVendor, requireAdmin, ownsOutlet } = require('../middleware/auth'
 const router = express.Router();
 
 /**
- * An outlet is orderable only if it is open AND the platform isn't paused.
+ * An outlet is orderable only if the platform isn't paused, an admin hasn't
+ * closed it, AND the vendor has it open. Three separate switches, each owned by
+ * someone different, and the most restrictive wins.
+ *
  * Applied on the customer-facing reads only — the vendor's own settings screen
  * still shows its real isOpen flag, so a global pause never silently rewrites
  * what a vendor thinks they configured.
  */
-const effectiveIsOpen = (restaurant, orderingEnabled) => orderingEnabled && restaurant.isOpen !== false;
+const effectiveIsOpen = (restaurant, orderingEnabled) =>
+  Boolean(orderingEnabled) && restaurant.adminClosed !== true && restaurant.isOpen !== false;
 
 // A rating shows only when the global switch AND the outlet's own flag allow it.
 const showRating = (restaurant, ratingsEnabled) =>
@@ -25,6 +29,44 @@ const guardOutlet = (req, res, restaurantId) => {
   if (ownsOutlet(req.user, restaurantId)) return true;
   res.status(403).json({ message: 'You can only manage your own outlet' });
   return false;
+};
+
+// What each role may write, named explicitly.
+//
+// This route used to hand req.body straight to findByIdAndUpdate with only
+// `rating` stripped, which meant a vendor could grant themselves anything the
+// schema had: `posEnabled: true` bypassed the admin's POS gate entirely, and
+// `payout.accountNumber` re-pointed their own settlement money with no admin
+// involvement or audit trail. An allowlist fails safe — a field added to the
+// schema later is unwritable until someone deliberately lists it here.
+const VENDOR_WRITABLE = [
+  'name', 'location', 'image', 'bannerImage', 'description',
+  'isOpen', 'waitTime',
+  'contactName', 'contactPhone', 'contactEmail',
+];
+
+// Admin-only. `rating`/`ratingEnabled` are the platform's call, not the
+// vendor's; `posEnabled` is access the admin grants; `adminClosed` is the
+// override a vendor must not be able to undo; payout details route real money.
+const ADMIN_ONLY_WRITABLE = [
+  'rating', 'ratingEnabled', 'posEnabled', 'adminClosed', 'adminClosedReason',
+  'vendorPasskey', 'payout',
+];
+
+/**
+ * Reduces a request body to the fields this caller is allowed to set.
+ * Returns { updates, rejected } — `rejected` is reported back so a vendor
+ * hitting an admin-only field is told, rather than silently ignored.
+ */
+const allowedUpdates = (body = {}, isAdmin) => {
+  const allowed = isAdmin ? [...VENDOR_WRITABLE, ...ADMIN_ONLY_WRITABLE] : VENDOR_WRITABLE;
+  const updates = {};
+  const rejected = [];
+  Object.keys(body).forEach((key) => {
+    if (allowed.includes(key)) updates[key] = body[key];
+    else rejected.push(key);
+  });
+  return { updates, rejected };
 };
 
 // GET /api/restaurants - Get all restaurants
@@ -146,9 +188,20 @@ router.put('/:id', requireVendor, async (req, res) => {
     if (mongoose.connection.readyState !== 1) return res.status(503).json({ message: 'Database not connected' });
     if (!guardOutlet(req, res, req.params.id)) return;
 
-    const updates = req.body || {};
-    // Only an admin decides a rating; a vendor cannot mark up its own.
-    if (req.user.role !== 'admin') delete updates.rating;
+    const isAdmin = req.user.role === 'admin';
+    const { updates, rejected } = allowedUpdates(req.body, isAdmin);
+
+    // Tell a vendor plainly that they reached for something that isn't theirs,
+    // rather than accepting the request and quietly dropping the field.
+    if (rejected.length) {
+      return res.status(403).json({
+        message: `Only an admin can change: ${rejected.join(', ')}`,
+      });
+    }
+    if (!Object.keys(updates).length) {
+      return res.status(400).json({ message: 'Nothing to update' });
+    }
+
     // If admin sent a vendorPasskey, hash it before storing. If an empty value was sent, clear the passkey.
     if (Object.prototype.hasOwnProperty.call(updates, 'vendorPasskey')) {
       if (updates.vendorPasskey) {

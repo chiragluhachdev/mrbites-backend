@@ -58,6 +58,11 @@ const OrderSchema = new mongoose.Schema({
   // finance additionally filters to source ONLINE.
   settlementStatus: { type: String, enum: ['pending', 'settled'], default: 'pending' },
   settledAt: { type: Date },
+  // Which payout claimed this order. Set by the same conditional update that
+  // flips settlementStatus, so a settlement can count exactly what it took
+  // rather than trusting a snapshot read beforehand — and so any order can be
+  // traced back to the bank transfer that paid for it.
+  settlementId: { type: mongoose.Schema.Types.ObjectId, ref: 'Settlement', index: true },
 
   status: {
     type: String,
@@ -72,7 +77,26 @@ OrderSchema.index({ restaurantId: 1, status: 1 });
 // Finance reads by payment date, and settlements by outlet.
 OrderSchema.index({ paidAt: -1 });
 OrderSchema.index({ restaurantId: 1, settlementStatus: 1, paidAt: -1 });
+// The admin settlements panel asks "what is owed, across every outlet" — no
+// restaurantId to narrow it, so the index above cannot serve it and the query
+// fell back to a full collection scan that grows with every order ever placed.
+OrderSchema.index({ settlementStatus: 1, source: 1, paidAt: -1 });
 // The dashboard and finance split the two lanes constantly.
 OrderSchema.index({ restaurantId: 1, source: 1, createdAt: -1 });
+
+// The last line of defence against duplicate orders.
+//
+// One Razorpay order may legitimately produce several MR-Bites orders — a cart
+// spanning two outlets is paid for once and splits into one order each — so the
+// pair, not the payment alone, is what must be unique. A retried or replayed
+// confirmation then cannot create a second copy: Mongo rejects it outright,
+// whatever the application layer happens to be doing.
+//
+// Partial, because POS orders carry no razorpayOrderId and null pairs would
+// otherwise collide with each other.
+OrderSchema.index(
+  { razorpayOrderId: 1, restaurantId: 1 },
+  { unique: true, partialFilterExpression: { razorpayOrderId: { $type: 'string' } } }
+);
 
 module.exports = mongoose.model('Order', OrderSchema);

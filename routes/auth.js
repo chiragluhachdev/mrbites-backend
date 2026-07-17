@@ -1,62 +1,39 @@
 const express = require('express');
 const bcrypt = require('bcrypt');
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
-const mongoose = require('mongoose');
 const axios = require('axios');
-const Otp = require('../models/Otp');
+const User = require('../models/User');
+const { JWT_SECRET } = require('../utils/secrets');
+const { issueOtp, consumeOtp, discardOtp } = require('../utils/otp');
 
 const router = express.Router();
 
-// POST /api/auth/register
-router.post('/register', async (req, res) => {
-  try {
-    const { name, phone, password } = req.body;
-    if (!name || !phone || !password) return res.status(400).json({ message: 'Missing fields' });
+/**
+ * The one shape a phone number is stored and compared in.
+ *
+ * Routes used to disagree — send-otp trimmed, register did not — so the same
+ * human could end up as two accounts, or fail to match their own OTP. Returns
+ * null for anything that is not a plausible Indian mobile number.
+ */
+const normalizePhone = (raw) => {
+  const digits = String(raw || '').replace(/\D/g, '');
+  // Tolerate a +91 / 0 prefix; the stored form is always the bare 10 digits.
+  const local = digits.replace(/^(?:91|0)(?=\d{10}$)/, '');
+  return /^[6-9]\d{9}$/.test(local) ? local : null;
+};
 
-    if (mongoose.connection.readyState !== 1) {
-      return res.status(503).json({ message: 'Database not connected' });
-    }
-
-    const existing = await User.findOne({ phone });
-    if (existing) return res.status(400).json({ message: 'Phone already registered' });
-
-    const hash = await bcrypt.hash(password, 10);
-    const user = new User({ name, phone, password: hash });
-    await user.save();
-
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
-    res.status(201).json({ token, user: { id: user._id, name: user.name, phone: user.phone } });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-
-// POST /api/auth/login
-router.post('/login', async (req, res) => {
-  try {
-    const { phone, password } = req.body;
-    if (!phone || !password) return res.status(400).json({ message: 'Missing fields' });
-
-    if (mongoose.connection.readyState !== 1) {
-      return res.status(503).json({ message: 'Database not connected' });
-    }
-
-    const user = await User.findOne({ phone });
-    if (!user) return res.status(400).json({ message: 'Invalid credentials' });
-
-    const match = await bcrypt.compare(password, user.password);
-    if (!match) return res.status(400).json({ message: 'Invalid credentials' });
-
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
-    res.json({ token, user: { id: user._id, name: user.name, phone: user.phone } });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
+// POST /api/auth/register and /login are gone.
+//
+// They were a second way in that OTP did not guard: /register accepted any
+// number without ever proving it belonged to the caller, so an attacker could
+// claim a stranger's number with a password of their choosing. The real owner
+// would later sign in by OTP — onto that same account — leaving the attacker
+// with lasting password access to it. Nothing in the app used these routes;
+// OTP is the only way a customer session is created.
+const retired = (req, res) => res.status(410).json({ message: 'Please sign in with your phone number.' });
+router.post('/register', retired);
+router.post('/login', retired);
 
 // POST /api/auth/vendor-login
 router.post('/vendor-login', async (req, res) => {
@@ -75,7 +52,7 @@ router.post('/vendor-login', async (req, res) => {
     if (!match) return res.status(401).json({ message: 'Invalid passkey' });
 
     // Issue a token scoped to vendor role and restaurantId
-    const token = jwt.sign({ role: 'vendor', restaurantId: restaurant._id }, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
+    const token = jwt.sign({ role: 'vendor', restaurantId: restaurant._id }, JWT_SECRET, { expiresIn: '7d' });
 
     res.json({ token, vendor: { restaurantId: restaurant._id, name: restaurant.name, posEnabled: !!restaurant.posEnabled } });
   } catch (err) {
@@ -96,7 +73,7 @@ router.post('/admin-login', async (req, res) => {
     const match = await bcrypt.compare(String(passkey), hash);
     if (!match) return res.status(401).json({ message: 'Invalid passkey' });
 
-    const token = jwt.sign({ role: 'admin' }, process.env.JWT_SECRET || 'secret', { expiresIn: '12h' });
+    const token = jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '12h' });
     res.json({ token, admin: { role: 'admin' } });
   } catch (err) {
     console.error(err);
@@ -116,7 +93,7 @@ router.get('/me', async (req, res) => {
     // Verify token
     let payload;
     try {
-      payload = jwt.verify(token, process.env.JWT_SECRET || 'secret');
+      payload = jwt.verify(token, JWT_SECRET);
     } catch (err) {
       if (err.name === 'TokenExpiredError') {
         return res.status(401).json({ message: 'Token expired' });
@@ -143,7 +120,7 @@ router.get('/me', async (req, res) => {
       const REFRESH_THRESHOLD = 60 * 60 * 24; // 1 day in seconds
       let newToken = null;
       if (timeLeft > 0 && timeLeft < REFRESH_THRESHOLD) {
-        newToken = jwt.sign({ role: 'vendor', restaurantId: restaurant._id }, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
+        newToken = jwt.sign({ role: 'vendor', restaurantId: restaurant._id }, JWT_SECRET, { expiresIn: '7d' });
       }
 
       return res.json({ vendor: { restaurantId: restaurant._id, name: restaurant.name, posEnabled: !!restaurant.posEnabled }, token: newToken });
@@ -160,7 +137,7 @@ router.get('/me', async (req, res) => {
     const REFRESH_THRESHOLD = 60 * 60 * 24; // 1 day in seconds
     let newToken = null;
     if (timeLeft > 0 && timeLeft < REFRESH_THRESHOLD) {
-      newToken = jwt.sign({ id: user._id }, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
+      newToken = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '7d' });
     }
 
     res.json({ user, token: newToken });
@@ -171,64 +148,80 @@ router.get('/me', async (req, res) => {
 });
 
 // POST /api/auth/send-otp
+//
+// Rate limited in two dimensions (see otpSendLimiter): per number, because each
+// send costs real money and lands on someone's phone; and per IP, so one host
+// cannot cycle through numbers.
 router.post('/send-otp', async (req, res) => {
   try {
-    const { phone } = req.body;
-    if (!phone) return res.status(400).json({ message: 'Missing phone number' });
-
-    const phoneRegex = /^[6-9]\d{9}$/;
-    if (!phoneRegex.test(phone.trim())) {
+    const phone = normalizePhone(req.body?.phone);
+    if (!phone) {
       return res.status(400).json({ message: 'Enter a valid 10-digit Indian mobile number' });
     }
 
-    // Generate a 6-digit OTP
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-
-    // Delete any existing OTPs for this phone to prevent brute-force
-    await Otp.deleteMany({ phone });
-    await Otp.create({ phone, otp });
-
-    // Send SMS via Fast2SMS using Quick Route (q) since OTP route requires Website Verification
-    const response = await axios.post('https://www.fast2sms.com/dev/bulkV2', {
-      message: `Your MR BITES login OTP is ${otp}`,
-      route: 'q',
-      numbers: phone
-    }, {
-      headers: {
-        'authorization': process.env.FAST2SMS_API_KEY,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    if (response.data.return === false) {
-       console.error('Fast2SMS Error:', response.data);
-       return res.status(500).json({ message: 'Failed to send OTP' });
+    const issued = await issueOtp(phone);
+    if (!issued.ok) {
+      // Still inside the cooldown. `retryAfter` drives the countdown in the app.
+      return res.status(429).json({
+        message: `Please wait ${issued.retryAfter}s before requesting another code.`,
+        retryAfter: issued.retryAfter,
+      });
     }
 
-    res.json({ message: 'OTP sent successfully' });
+    try {
+      const response = await axios.post(
+        'https://www.fast2sms.com/dev/bulkV2',
+        {
+          message: `Your MR BITES login OTP is ${issued.otp}`,
+          route: 'q',
+          numbers: phone,
+        },
+        {
+          headers: {
+            authorization: process.env.FAST2SMS_API_KEY,
+            'Content-Type': 'application/json',
+          },
+          timeout: 10000,
+        }
+      );
+
+      if (response.data.return === false) {
+        console.error('Fast2SMS Error:', response.data);
+        // Our provider failed, not the user — drop the code so they are not
+        // held behind a cooldown for a message that never arrived.
+        await discardOtp(phone);
+        return res.status(502).json({ message: 'Could not send the OTP right now. Please try again.' });
+      }
+    } catch (smsErr) {
+      await discardOtp(phone);
+      console.error('Send OTP failed', smsErr?.message || smsErr);
+      return res.status(502).json({ message: 'Could not send the OTP right now. Please try again.' });
+    }
+
+    // The app counts down from this before re-enabling "Resend".
+    res.json({ message: 'OTP sent successfully', retryAfter: issued.retryAfter });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Send OTP failed', err?.message || err);
+    res.status(500).json({ message: 'Could not send the OTP right now. Please try again.' });
   }
 });
 
-// POST /api/auth/verify-otp
+// POST /api/auth/verify-otp — the only way to obtain a customer session.
 router.post('/verify-otp', async (req, res) => {
   try {
-    const { phone, otp, name } = req.body;
-    if (!phone || !otp) return res.status(400).json({ message: 'Missing fields' });
+    const phone = normalizePhone(req.body?.phone);
+    const { otp, name } = req.body || {};
+    if (!phone) return res.status(400).json({ message: 'Enter a valid 10-digit Indian mobile number' });
 
-    // Verify OTP
-    const otpRecord = await Otp.findOne({ phone, otp });
-    if (!otpRecord) return res.status(400).json({ message: 'Invalid or expired OTP' });
+    const check = await consumeOtp(phone, otp);
+    if (!check.ok) return res.status(400).json({ message: check.message });
 
-    // OTP is valid, delete it so it can't be reused
-    await Otp.deleteOne({ _id: otpRecord._id });
-
-    // Check if user exists
     let user = await User.findOne({ phone });
     if (!user) {
-      const randomPassword = await bcrypt.hash(require('crypto').randomBytes(32).toString('hex'), 10);
+      // Sessions are proven by OTP, so the password column is vestigial for
+      // customers. It stays non-null with an unguessable value rather than being
+      // made optional, so no account can ever be signed into with a blank one.
+      const randomPassword = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 10);
       // No name when someone signs in by OTP without signing up. The app spots
       // the blank and asks them, instead of labelling them "User" forever.
       user = new User({ name: (name || '').trim(), phone, password: randomPassword });
@@ -239,10 +232,10 @@ router.post('/verify-otp', async (req, res) => {
       await user.save();
     }
 
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
+    const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ token, user: { id: user._id, name: user.name, phone: user.phone } });
   } catch (err) {
-    console.error(err);
+    console.error('Verify OTP failed', err);
     res.status(500).json({ message: 'Server error' });
   }
 });

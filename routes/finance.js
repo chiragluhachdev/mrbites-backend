@@ -2,8 +2,10 @@ const express = require('express');
 const mongoose = require('mongoose');
 const Order = require('../models/Order');
 const Restaurant = require('../models/Restaurant');
+const Settlement = require('../models/Settlement');
 const { requireVendor, requireAdmin } = require('../middleware/auth');
 const { round2 } = require('../utils/pricing');
+const { istDateRange, dayKeyIST, IST_TIMEZONE } = require('../utils/time');
 
 const router = express.Router();
 
@@ -21,15 +23,14 @@ const router = express.Router();
 const EARNING = { status: { $ne: 'cancelled' }, source: { $ne: 'POS' } };
 const POS_EARNING = { status: { $ne: 'cancelled' }, source: 'POS' };
 
-const startOfDay = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; };
-const endOfDay = (d) => { const x = new Date(d); x.setHours(23, 59, 59, 999); return x; };
-
-/** Reads ?from=&to= (YYYY-MM-DD, local days), defaulting to today. */
-const dateRange = (query) => {
-  const from = query.from ? startOfDay(query.from) : startOfDay(new Date());
-  const to = query.to ? endOfDay(query.to) : endOfDay(query.from || new Date());
-  return { from, to };
-};
+// Days are IST days, not the server's.
+//
+// These used to be `setHours(0,0,0,0)` in whatever timezone the host happened to
+// run in. On a UTC box that rolls the day at 05:30 IST, so a 1am sale landed in
+// yesterday's report and the totals here never matched what a vendor counted at
+// the till. `istDateRange` pins the boundary to the business, wherever it is
+// deployed, and the frontend uses the same rule so both agree on "Today".
+const dateRange = istDateRange;
 
 const sum = (orders, pick = (o) => o.total) => round2(orders.reduce((s, o) => s + pick(o), 0));
 
@@ -54,21 +55,39 @@ router.get('/vendor', requireVendor, async (req, res) => {
     // Admins may pass ?restaurantId= to inspect any outlet.
     const restaurantId = req.user.role === 'admin' ? req.query.restaurantId : req.user.restaurantId;
     if (!restaurantId) return res.status(400).json({ message: 'Missing restaurantId' });
+    if (!mongoose.isValidObjectId(String(restaurantId))) {
+      // Casting an unchecked value straight to an ObjectId throws, which
+      // surfaced as a 500 on what is really a bad request.
+      return res.status(400).json({ message: 'Invalid restaurantId' });
+    }
 
     const rid = new mongoose.Types.ObjectId(String(restaurantId));
     const scope = { restaurantId: rid, ...EARNING };
     const { from, to } = dateRange(req.query);
 
+    // Projections matter here. These queries used to pull whole documents —
+    // every line item of every order — when all that is wanted is a column to
+    // sum. On an outlet with a few thousand orders that is megabytes off the
+    // database and through Node's JSON encoder to produce one number.
     const [inRange, pending, settled, posInRange, restaurant] = await Promise.all([
-      Order.find({ ...scope, paidAt: { $gte: from, $lte: to } }).sort({ paidAt: -1 }).lean(),
-      Order.find({ ...scope, settlementStatus: 'pending' }).lean(),
-      Order.find({ ...scope, settlementStatus: 'settled' }).lean(),
+      Order.find({ ...scope, paidAt: { $gte: from, $lte: to } })
+        .select('paidAt customer total status settlementStatus settledAt items.name')
+        .sort({ paidAt: -1 })
+        .lean(),
+      // Only ever summed and counted.
+      Order.find({ ...scope, settlementStatus: 'pending' }).select('total').lean(),
+      Order.find({ ...scope, settlementStatus: 'settled' }).select('total').lean(),
       // POS sales in the same window — the vendor already holds this cash, so it
       // is reported as a separate tally, never as pending settlement.
-      Order.find({ restaurantId: rid, ...POS_EARNING, paidAt: { $gte: from, $lte: to } }).lean(),
-      // The account number is select:false, so ask for it explicitly and mask it
-      // before it goes out.
-      Restaurant.findById(restaurantId).select('+payout.accountNumber').lean(),
+      Order.find({ restaurantId: rid, ...POS_EARNING, paidAt: { $gte: from, $lte: to } })
+        .select('total posPaymentMethod')
+        .lean(),
+      // Every payout field is select:false so the public outlet listing can
+      // never leak them. This is the one screen entitled to them, so ask
+      // explicitly — and the account number is still masked on the way out.
+      Restaurant.findById(restaurantId)
+        .select('name +payout.accountNumber +payout.accountHolder +payout.ifsc +payout.bankName +payout.pan')
+        .lean(),
     ]);
 
     // POS split by how it was paid, for the vendor's own reconciliation.
@@ -79,7 +98,7 @@ router.get('/vendor', requireVendor, async (req, res) => {
     });
 
     res.json({
-      range: { from, to },
+      range: { from, to, timezone: IST_TIMEZONE },
       outlet: restaurant
         ? { id: restaurant._id, name: restaurant.name, payout: publicPayout(restaurant.payout) }
         : null,
@@ -116,11 +135,17 @@ router.get('/admin', requireAdmin, async (req, res) => {
 
     const [inRange, pendingAll, settledAll, restaurants] = await Promise.all([
       Order.find({ ...EARNING, paidAt: { $gte: from, $lte: to } })
+        .select('paidAt customer total status settlementStatus restaurantId items.name')
         .sort({ paidAt: -1 })
         .populate('restaurantId', 'name')
         .lean(),
-      Order.find({ ...EARNING, settlementStatus: 'pending' }).populate('restaurantId', 'name').lean(),
-      Order.find({ ...EARNING, settlementStatus: 'settled' }).lean(),
+      // Grouped per outlet and summed — the id and the amount are all that is read.
+      Order.find({ ...EARNING, settlementStatus: 'pending' })
+        .select('total restaurantId')
+        .populate('restaurantId', 'name')
+        .lean(),
+      // Summed only.
+      Order.find({ ...EARNING, settlementStatus: 'settled' }).select('total').lean(),
       Restaurant.find().select('name').lean(),
     ]);
 
@@ -145,7 +170,7 @@ router.get('/admin', requireAdmin, async (req, res) => {
     const settlements = [...byOutlet.values()].sort((a, b) => b.amount - a.amount);
 
     res.json({
-      range: { from, to },
+      range: { from, to, timezone: IST_TIMEZONE },
       totals: {
         collection,
         paidOrders: inRange.length,
@@ -174,40 +199,85 @@ router.get('/admin', requireAdmin, async (req, res) => {
   }
 });
 
-// POST /api/finance/settle — mark an outlet's outstanding orders as paid out.
-// Settlement is a manual bank transfer; this only records that it happened.
+// POST /api/finance/settle — record that an outlet's outstanding orders were
+// paid out. Settlement is a manual bank transfer; this only books it.
+//
+// The previous version read the outstanding orders, updated them unconditionally
+// by id, then reported the *snapshot's* total. Two admins clicking at once — or
+// one double-click — would both be told the full amount had settled, because
+// neither reported what it had actually claimed. An admin paying against those
+// confirmations pays twice.
+//
+// Now the update itself is the claim: it filters on `settlementStatus: 'pending'`
+// and stamps a settlementId, so each order can be claimed exactly once. The
+// amount is then counted from the orders this call really took. A concurrent
+// second call claims nothing and is told so.
 router.post('/settle', requireAdmin, async (req, res) => {
   try {
-    const { restaurantId } = req.body;
-    if (!restaurantId) return res.status(400).json({ message: 'Missing restaurantId' });
+    const { restaurantId, reference, note } = req.body;
+    if (!restaurantId || !mongoose.isValidObjectId(String(restaurantId))) {
+      return res.status(400).json({ message: 'Missing or invalid restaurantId' });
+    }
 
-    const restaurant = await Restaurant.findById(restaurantId).lean();
+    const restaurant = await Restaurant.findById(restaurantId).select('name').lean();
     if (!restaurant) return res.status(404).json({ message: 'Outlet not found' });
 
-    const outstanding = await Order.find({
-      restaurantId,
-      settlementStatus: 'pending',
-      ...EARNING,
-    }).lean();
+    const settlementId = new mongoose.Types.ObjectId();
+    const settledAt = new Date();
 
-    if (!outstanding.length) {
+    // Claim: only rows still pending are taken, and they are marked with this
+    // settlement's id so we can count exactly what we got.
+    await Order.updateMany(
+      { restaurantId, settlementStatus: 'pending', ...EARNING },
+      { settlementStatus: 'settled', settledAt, settlementId }
+    );
+
+    const claimed = await Order.find({ settlementId }).select('_id total').lean();
+
+    if (!claimed.length) {
       return res.status(400).json({ message: 'Nothing outstanding for this outlet' });
     }
 
-    const settledAt = new Date();
-    const result = await Order.updateMany(
-      { _id: { $in: outstanding.map((o) => o._id) } },
-      { settlementStatus: 'settled', settledAt }
-    );
+    const amount = sum(claimed);
+
+    const settlement = await Settlement.create({
+      _id: settlementId,
+      restaurantId,
+      restaurantName: restaurant.name,
+      orderIds: claimed.map((o) => o._id),
+      orderCount: claimed.length,
+      amount,
+      dayKey: dayKeyIST(settledAt),
+      reference: (reference || '').trim(),
+      note: (note || '').trim(),
+      settledAt,
+    });
 
     res.json({
-      message: `Settled ${result.modifiedCount} order(s) for ${restaurant.name}`,
-      orders: result.modifiedCount,
-      amount: sum(outstanding),
+      message: `Settled ${claimed.length} order(s) for ${restaurant.name}`,
+      settlementId: settlement._id,
+      orders: claimed.length,
+      amount,
       settledAt,
     });
   } catch (err) {
     console.error('Settle failed', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// GET /api/finance/settlements — the payout history, newest first.
+router.get('/settlements', requireAdmin, async (req, res) => {
+  try {
+    const filter = {};
+    if (req.query.restaurantId && mongoose.isValidObjectId(String(req.query.restaurantId))) {
+      filter.restaurantId = req.query.restaurantId;
+    }
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const settlements = await Settlement.find(filter).sort({ settledAt: -1 }).limit(limit).lean();
+    res.json({ settlements });
+  } catch (err) {
+    console.error('Fetch settlements failed', err);
     res.status(500).json({ message: 'Server error' });
   }
 });

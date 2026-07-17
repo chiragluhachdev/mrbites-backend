@@ -1,13 +1,27 @@
 const jwt = require('jsonwebtoken');
+const { JWT_SECRET } = require('../utils/secrets');
 
 const authenticate = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ message: 'Unauthorized' });
   try {
-    req.user = jwt.verify(token, process.env.JWT_SECRET || 'secret');
+    req.user = jwt.verify(token, JWT_SECRET);
     next();
   } catch {
     return res.status(401).json({ message: 'Invalid or expired token' });
+  }
+};
+
+/**
+ * Verifies a token outside the request cycle — used by the socket handshake,
+ * which has no res to answer with. Returns the payload, or null.
+ */
+const verifyToken = (token) => {
+  if (!token) return null;
+  try {
+    return jwt.verify(String(token), JWT_SECRET);
+  } catch {
+    return null;
   }
 };
 
@@ -41,4 +55,4 @@ const ownsOutlet = (user, restaurantId) => {
   return String(user.restaurantId) === String(restaurantId);
 };
 
-module.exports = { authenticate, requireVendor, requireAdmin, ownsOutlet };
+module.exports = { authenticate, verifyToken, requireVendor, requireAdmin, ownsOutlet };
