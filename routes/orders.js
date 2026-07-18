@@ -416,7 +416,7 @@ router.get('/mine', authenticate, async (req, res) => {
     const orders = await Order.find({ 'customer.phone': user.phone })
       .sort({ createdAt: -1 })
       .limit(limit)
-      .populate('restaurantId', 'name')
+      .populate('restaurantId', 'name location')
       .populate('items.itemId', 'image imageUrl');
     res.json({ orders });
   } catch (err) {
