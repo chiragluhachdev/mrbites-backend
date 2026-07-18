@@ -297,24 +297,21 @@ router.post('/confirm', authenticate, async (req, res) => {
   }
 });
 
-// POST /api/orders/demo — a no-payment order, for demo mode and store review.
+// POST /api/orders/demo — a no-payment order for the demo/review account.
 //
 // Same cart, same server-side pricing, same validation as a real order — so the
 // flow a reviewer walks is genuinely the app's flow — but no Razorpay, no money,
 // and an isDemo stamp that keeps it out of every view except the customer's own
-// history. Allowed only when the platform is in demo mode, or for the review
-// account; a normal user in normal operation gets a 403 and the real flow.
+// history. Only the demo account (isDemo flag on User) may use this; a normal
+// user gets a 403 and must go through the real payment flow.
 router.post('/demo', authenticate, async (req, res) => {
   try {
-    const [settings, user] = await Promise.all([
-      Settings.get(),
-      User.findById(req.user.id).select('name phone isDemo').lean(),
-    ]);
+    const user = await User.findById(req.user.id).select('name phone isDemo').lean();
     if (!user) return res.status(401).json({ message: 'Please sign in again.' });
 
-    if (!settings.demoMode && !user.isDemo) {
-      // Not a demo context — the client should be using the real payment flow.
-      return res.status(403).json({ message: 'Demo checkout is not available right now.' });
+    if (!user.isDemo) {
+      // Not the demo account — the client should be using the real payment flow.
+      return res.status(403).json({ message: 'Demo checkout is not available for this account.' });
     }
 
     const priced = await priceCart(req.body?.items);

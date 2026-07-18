@@ -8,7 +8,6 @@ const publicSettings = (s) => ({
   orderingEnabled: s.orderingEnabled,
   pausedMessage: s.pausedMessage,
   ratingsEnabled: s.ratingsEnabled,
-  demoMode: !!s.demoMode,
 });
 
 // GET /api/settings — public: the app needs to know whether ordering is live.
@@ -25,11 +24,10 @@ router.get('/', async (req, res) => {
 // PUT /api/settings — admin only.
 router.put('/', requireAdmin, async (req, res) => {
   try {
-    const { orderingEnabled, pausedMessage, ratingsEnabled, demoMode } = req.body || {};
+    const { orderingEnabled, pausedMessage, ratingsEnabled } = req.body || {};
     const updates = {};
     if (typeof orderingEnabled === 'boolean') updates.orderingEnabled = orderingEnabled;
     if (typeof ratingsEnabled === 'boolean') updates.ratingsEnabled = ratingsEnabled;
-    if (typeof demoMode === 'boolean') updates.demoMode = demoMode;
     if (typeof pausedMessage === 'string') updates.pausedMessage = pausedMessage.trim();
 
     if (!Object.keys(updates).length) {

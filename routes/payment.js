@@ -3,7 +3,6 @@ const rateLimit = require('express-rate-limit');
 
 const User = require('../models/User');
 const OrderDraft = require('../models/OrderDraft');
-const Settings = require('../models/Settings');
 const { authenticate } = require('../middleware/auth');
 const { priceCart } = require('../utils/priceCart');
 const { razorpay, isConfigured, key_id } = require('../utils/razorpay');
@@ -51,16 +50,10 @@ router.post('/create-order', authenticate, perUserPaymentLimiter, async (req, re
       return res.status(503).json({ message: 'Payments are not configured right now.' });
     }
 
-    // No real payment may be opened in a demo context. The client routes to the
-    // demo order flow instead, but this refusal is the actual guarantee — a
-    // tampered client still cannot reach Razorpay when demo mode is on or the
-    // caller is the review account.
-    const [settings, payer] = await Promise.all([
-      Settings.get(),
-      User.findById(req.user.id).select('isDemo').lean(),
-    ]);
-    if (settings.demoMode || payer?.isDemo) {
-      return res.status(409).json({ reason: 'demo_mode', message: 'Demo mode is on — no real payment is taken.' });
+    // The demo account must never reach Razorpay — it uses /orders/demo instead.
+    const payer = await User.findById(req.user.id).select('isDemo').lean();
+    if (payer?.isDemo) {
+      return res.status(409).json({ reason: 'demo_user', message: 'Demo account — use the demo checkout flow instead.' });
     }
 
     const { items, pickupType, notes } = req.body || {};
