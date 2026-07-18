@@ -295,7 +295,10 @@ mongoose
     useUnifiedTopology: true,
   })
   .then(() => {
-    console.log('✅ MongoDB connected');
+    // Log the exact database this deployment is bound to. If send and verify
+    // ever disagreed on the code, the first thing to rule out is that they are
+    // talking to different databases — this makes the answer visible at boot.
+    console.log(`✅ MongoDB connected — db="${mongoose.connection.name}" host=${mongoose.connection.host}`);
     server.listen(PORT, '0.0.0.0', () => {
       console.log(`🚀 Server running on port ${PORT}`);
     });

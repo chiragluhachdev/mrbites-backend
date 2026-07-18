@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
@@ -9,6 +10,19 @@ const { issueOtp, consumeOtp, discardOtp } = require('../utils/otp');
 const { DEMO_LOGIN_OTP, DEMO_NAME, isDemoPhone } = require('../utils/demo');
 
 const router = express.Router();
+
+// Temporary tracing for the "correct OTP rejected" investigation. Never prints
+// the raw phone or the code — only the last four digits — so it is safe in prod.
+// It answers three questions from the logs alone: what number each endpoint
+// actually received (before and after normalisation, to catch drift between
+// send and verify), and which database the request is bound to (to prove send
+// and verify hit the same place).
+const last4 = (v) => { const s = String(v || '').replace(/\D/g, ''); return s ? '••••' + s.slice(-4) : '(none)'; };
+const traceOtp = (route, rawPhone, normPhone) =>
+  console.log(
+    `[otp] ${route} recv=${last4(rawPhone)} normalized=${last4(normPhone)} ` +
+    `db=${mongoose.connection.name} rs=${mongoose.connection.readyState}`
+  );
 
 /**
  * The one shape a phone number is stored and compared in.
@@ -156,6 +170,7 @@ router.get('/me', async (req, res) => {
 router.post('/send-otp', async (req, res) => {
   try {
     const phone = normalizePhone(req.body?.phone);
+    traceOtp('send-otp', req.body?.phone, phone);
     if (!phone) {
       return res.status(400).json({ message: 'Enter a valid 10-digit Indian mobile number' });
     }
@@ -223,6 +238,7 @@ router.post('/verify-otp', async (req, res) => {
   try {
     const phone = normalizePhone(req.body?.phone);
     const { otp, name } = req.body || {};
+    traceOtp('verify-otp', req.body?.phone, phone);
     if (!phone) return res.status(400).json({ message: 'Enter a valid 10-digit Indian mobile number' });
 
     const demo = isDemoPhone(phone);

@@ -68,7 +68,7 @@ const issueOtp = async (phone) => {
     { new: true }
   );
   if (claimed) {
-    log('reuse', normalized, `otp=${claimed.otp}`);
+    log('reuse', normalized);
     return { ok: true, otp: claimed.otp, retryAfter: OTP_RESEND_COOLDOWN_SECONDS, reused: true, sentAt: claimed.lastSentAt };
   }
 
@@ -85,7 +85,7 @@ const issueOtp = async (phone) => {
   const sentAt = new Date(now);
   try {
     await Otp.create({ phone: normalized, otp, attempts: 0, lastSentAt: sentAt, createdAt: sentAt });
-    log('create', normalized, `otp=${otp}`);
+    log('create', normalized);
     return { ok: true, otp, retryAfter: OTP_RESEND_COOLDOWN_SECONDS, reused: false, sentAt };
   } catch (err) {
     // The unique index fired: a concurrent request created it a moment ago.
@@ -98,7 +98,7 @@ const issueOtp = async (phone) => {
           log('cooldown', normalized, `retryAfter=${remaining}s (raced)`);
           return { ok: false, retryAfter: Math.max(1, remaining) };
         }
-        log('reuse', normalized, `otp=${e.otp} (raced)`);
+        log('reuse', normalized, '(raced)');
         return { ok: true, otp: e.otp, retryAfter: OTP_RESEND_COOLDOWN_SECONDS, reused: true, sentAt: e.lastSentAt };
       }
     }
