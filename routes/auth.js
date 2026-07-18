@@ -237,11 +237,25 @@ router.post('/send-otp', async (req, res) => {
 
 // POST /api/auth/verify-otp — the only way to obtain a customer session.
 router.post('/verify-otp', async (req, res) => {
+  const reqId = Date.now().toString();
+  console.log(`[verify-otp:${reqId}] START`);
+  console.log(`[verify-otp:${reqId}] Body received:`, { ...req.body, otp: '***' });
+  
+  // Custom response wrapper to log what we send back
+  const originalJson = res.json.bind(res);
+  res.json = (body) => {
+    console.log(`[verify-otp:${reqId}] SENDING RESPONSE. Status: ${res.statusCode}. Body:`, body);
+    return originalJson(body);
+  };
+
   try {
     const phone = normalizePhone(req.body?.phone);
     const { otp, name } = req.body || {};
     traceOtp('verify-otp', req.body?.phone, phone);
-    if (!phone) return res.status(400).json({ message: 'Enter a valid 10-digit Indian mobile number' });
+    if (!phone) {
+      console.log(`[verify-otp:${reqId}] FAILED: Invalid phone`);
+      return res.status(400).json({ message: 'Enter a valid 10-digit Indian mobile number' });
+    }
 
     const demo = isDemoPhone(phone);
     if (demo) {
@@ -250,14 +264,21 @@ router.post('/verify-otp', async (req, res) => {
       const a = Buffer.from(String(otp || ''));
       const b = Buffer.from(DEMO_LOGIN_OTP);
       const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
-      if (!ok) return res.status(400).json({ message: 'Incorrect code.' });
+      if (!ok) {
+        console.log(`[verify-otp:${reqId}] FAILED: Incorrect code (Demo)`);
+        return res.status(400).json({ message: 'Incorrect code.' });
+      }
     } else {
       const check = await consumeOtp(phone, otp);
-      if (!check.ok) return res.status(400).json({ message: check.message });
+      if (!check.ok) {
+        console.log(`[verify-otp:${reqId}] FAILED: OTP rejected by consumeOtp. Message:`, check.message);
+        return res.status(400).json({ message: check.message });
+      }
     }
 
     let user = await User.findOne({ phone });
     if (!user) {
+      console.log(`[verify-otp:${reqId}] Creating new user for phone...`);
       // Sessions are proven by OTP, so the password column is vestigial for
       // customers. It stays non-null with an unguessable value rather than being
       // made optional, so no account can ever be signed into with a blank one.
@@ -271,7 +292,9 @@ router.post('/verify-otp', async (req, res) => {
         isDemo: demo,
       });
       await user.save();
+      console.log(`[verify-otp:${reqId}] New user created with ID:`, user._id);
     } else {
+      console.log(`[verify-otp:${reqId}] Found existing user ID:`, user._id);
       // Keep the demo flag in step even for a pre-existing record, and fill a
       // blank name when they finally give one.
       if (demo && !user.isDemo) user.isDemo = true;
@@ -280,9 +303,10 @@ router.post('/verify-otp', async (req, res) => {
     }
 
     const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '7d' });
+    console.log(`[verify-otp:${reqId}] SUCCESS. Sending JWT and user data.`);
     res.json({ token, user: { id: user._id, name: user.name, phone: user.phone, isDemo: !!user.isDemo } });
   } catch (err) {
-    console.error('Verify OTP failed', err);
+    console.error(`[verify-otp:${reqId}] SERVER EXCEPTION:`, err);
     res.status(500).json({ message: 'Server error' });
   }
 });
