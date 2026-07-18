@@ -57,6 +57,7 @@ const OrderSchema = new mongoose.Schema({
   // An ONLINE order exists only once its Razorpay signature has verified; a POS
   // order is paid the moment the vendor completes the sale.
   paidAt: { type: Date, required: true },
+  expiresAt: { type: Date }, // Set for ONLINE orders to auto-cancel if unacknowledged
   razorpayOrderId: { type: String },
   razorpayPaymentId: { type: String },
 

@@ -18,6 +18,7 @@ const rateLimit = require('express-rate-limit');
 // client hop addresses within its own allocation and sidestep the limit.
 const { ipKeyGenerator } = require('express-rate-limit');
 const { verifyToken, ownsOutlet } = require('./middleware/auth');
+const { startOrderScheduler } = require('./utils/orderScheduler');
 
 // Import routers
 const ordersRouter = require('./routes/orders');
@@ -299,6 +300,10 @@ mongoose
     // ever disagreed on the code, the first thing to rule out is that they are
     // talking to different databases — this makes the answer visible at boot.
     console.log(`✅ MongoDB connected — db="${mongoose.connection.name}" host=${mongoose.connection.host}`);
+    
+    // Start the background worker for auto-cancelling expired orders
+    startOrderScheduler(io);
+
     server.listen(PORT, '0.0.0.0', () => {
       console.log(`🚀 Server running on port ${PORT}`);
     });

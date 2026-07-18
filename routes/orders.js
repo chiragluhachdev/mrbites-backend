@@ -254,6 +254,7 @@ router.post('/confirm', authenticate, async (req, res) => {
       notes: claimed.notes,
       customer: claimed.customer,
       paidAt,
+      expiresAt: new Date(Date.now() + 120000),
       razorpayOrderId: razorpay_order_id,
       razorpayPaymentId: razorpay_payment_id,
       settlementStatus: 'pending',
@@ -332,6 +333,7 @@ router.post('/demo', authenticate, async (req, res) => {
       notes: req.body?.notes,
       customer,
       paidAt: now,
+      expiresAt: new Date(Date.now() + 120000),
       // Settled with no obligation, belt-and-braces alongside the isDemo filters,
       // so a demo order can never read as money owed even if a filter is missed.
       settlementStatus: 'settled',
