@@ -15,14 +15,21 @@ const OTP_EXPIRY_MS = OTP_TTL_SECONDS * 1000;
 const OTP_RESEND_COOLDOWN_SECONDS = 30;
 const OTP_RESEND_COOLDOWN_MS = OTP_RESEND_COOLDOWN_SECONDS * 1000;
 
+// Per-event tracing is off unless OTP_DEBUG is set, so production logs stay
+// quiet. Flip OTP_DEBUG=1 in the environment to trace a login end-to-end again.
+// Genuine SMS errors are logged separately and always, not through this.
+const OTP_DEBUG = process.env.OTP_DEBUG === '1' || process.env.OTP_DEBUG === 'true';
+
 // Never log a full number. Last four is enough to correlate events for one user
 // while keeping the log from becoming a directory of who signed in when.
 const mask = (phone) => {
   const p = String(phone || '');
   return p.length >= 4 ? `••••••${p.slice(-4)}` : '••••';
 };
-const log = (event, phone, extra = '') =>
+const log = (event, phone, extra = '') => {
+  if (!OTP_DEBUG) return;
   console.log(`[otp] ${event} phone=${mask(phone)}${extra ? ' ' + extra : ''}`);
+};
 
 /** A six-digit code. crypto rather than Math.random: this is a credential. */
 const generateOtp = () => String(crypto.randomInt(100000, 1000000));

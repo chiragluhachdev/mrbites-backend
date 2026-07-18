@@ -11,18 +11,20 @@ const { DEMO_LOGIN_OTP, DEMO_NAME, isDemoPhone } = require('../utils/demo');
 
 const router = express.Router();
 
-// Temporary tracing for the "correct OTP rejected" investigation. Never prints
-// the raw phone or the code — only the last four digits — so it is safe in prod.
-// It answers three questions from the logs alone: what number each endpoint
-// actually received (before and after normalisation, to catch drift between
-// send and verify), and which database the request is bound to (to prove send
-// and verify hit the same place).
+// Endpoint-level tracing for the "correct OTP rejected" investigation. Off
+// unless OTP_DEBUG is set. Never prints the raw phone or the code — only the
+// last four digits — so it is safe to switch on in prod. It answers, from the
+// logs alone: what number each endpoint received (raw and normalised, to catch
+// drift between send and verify) and which database it is bound to.
+const OTP_DEBUG = process.env.OTP_DEBUG === '1' || process.env.OTP_DEBUG === 'true';
 const last4 = (v) => { const s = String(v || '').replace(/\D/g, ''); return s ? '••••' + s.slice(-4) : '(none)'; };
-const traceOtp = (route, rawPhone, normPhone) =>
+const traceOtp = (route, rawPhone, normPhone) => {
+  if (!OTP_DEBUG) return;
   console.log(
     `[otp] ${route} recv=${last4(rawPhone)} normalized=${last4(normPhone)} ` +
     `db=${mongoose.connection.name} rs=${mongoose.connection.readyState}`
   );
+};
 
 /**
  * The one shape a phone number is stored and compared in.
@@ -224,7 +226,7 @@ router.post('/send-otp', async (req, res) => {
       return res.status(502).json({ message: 'Could not send the OTP right now. Please try again.' });
     }
 
-    console.log(`[otp] sms-sent phone=••••••${phone.slice(-4)} reused=${issued.reused}`);
+    if (OTP_DEBUG) console.log(`[otp] sms-sent phone=••••••${phone.slice(-4)} reused=${issued.reused}`);
     // The app counts down from this before re-enabling "Resend".
     res.json({ message: 'OTP sent successfully', retryAfter: issued.retryAfter });
   } catch (err) {
