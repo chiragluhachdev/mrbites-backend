@@ -23,6 +23,10 @@ const DraftItemSchema = new mongoose.Schema({
   name: { type: String, required: true },
   price: { type: Number, required: true },
   qty: { type: Number, required: true },
+  // Carried from the live menu by priceCart so the order snapshot keeps the
+  // image permanently. Without this field the draft would drop it, and the
+  // saved order would have no image — only the live-lookup fallback.
+  image: { type: String },
   modifiers: { type: [DraftModifierSchema], default: [] },
 }, { _id: false });
 

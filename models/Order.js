@@ -17,6 +17,7 @@ const OrderItemSchema = new mongoose.Schema({
   price: { type: Number, required: true },
   qty: { type: Number, required: true },
   modifiers: { type: [OrderItemModifierSchema], default: [] },
+  image: { type: String },
   // Optional per-line instruction (used by the POS: "no onion", etc.).
   note: { type: String },
 });

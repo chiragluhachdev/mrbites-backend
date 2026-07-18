@@ -161,6 +161,7 @@ const priceCart = async (lines) => {
     byOutlet.get(rid).items.push({
       itemId: item._id,
       name: item.name, // authoritative — the client's label is ignored
+      image: item.image || item.imageUrl, // carry the image forward for order snapshot
       price: unitPrice,
       qty: Number(line.qty),
       modifiers: resolved.modifiers,
