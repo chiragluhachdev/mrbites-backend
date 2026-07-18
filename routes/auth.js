@@ -175,6 +175,12 @@ router.post('/send-otp', async (req, res) => {
       });
     }
 
+    // On failure, only ever discard THIS send's code, and only for a fresh one.
+    // A resend must never delete the code — an earlier SMS may already hold it —
+    // and the sentAt guard means a delayed failure of an old send can't delete a
+    // code a later resend has since delivered.
+    const undoOnFailure = () => (issued.reused ? Promise.resolve() : discardOtp(phone, issued.sentAt));
+
     try {
       const response = await axios.post(
         'https://www.fast2sms.com/dev/bulkV2',
@@ -193,18 +199,17 @@ router.post('/send-otp', async (req, res) => {
       );
 
       if (response.data.return === false) {
-        console.error('Fast2SMS Error:', response.data);
-        // Only drop a brand-new code. If this was a resend, an earlier SMS may
-        // already have reached them — discarding would strand a code they hold.
-        if (!issued.reused) await discardOtp(phone);
+        console.error('[otp] sms-failed', response.data);
+        await undoOnFailure();
         return res.status(502).json({ message: 'Could not send the OTP right now. Please try again.' });
       }
     } catch (smsErr) {
-      if (!issued.reused) await discardOtp(phone);
-      console.error('Send OTP failed', smsErr?.message || smsErr);
+      await undoOnFailure();
+      console.error('[otp] sms-error', smsErr?.message || smsErr);
       return res.status(502).json({ message: 'Could not send the OTP right now. Please try again.' });
     }
 
+    console.log(`[otp] sms-sent phone=••••••${phone.slice(-4)} reused=${issued.reused}`);
     // The app counts down from this before re-enabling "Resend".
     res.json({ message: 'OTP sent successfully', retryAfter: issued.retryAfter });
   } catch (err) {
