@@ -31,6 +31,7 @@ const razorpayWebhookRouter = require('./routes/razorpayWebhook');
 const uploadRouter = require('./routes/upload');
 const financeRouter = require('./routes/finance');
 const settingsRouter = require('./routes/settings');
+const { isDemoPhone } = require('./utils/demo');
 
 const app = express();
 
@@ -141,6 +142,10 @@ const otpSendPhoneLimiter = rateLimit({
   max: 8,
   standardHeaders: true,
   legacyHeaders: false,
+  // The demo/review number sends no real SMS (it returns a fixed code), so there
+  // is nothing to abuse — exempt it from the per-phone cap so an app-store
+  // reviewer retrying the login can never be locked out with "too many codes".
+  skip: (req) => isDemoPhone(String(req.body?.phone || '').replace(/\D/g, '')),
   keyGenerator: (req, res) => {
     const phone = String(req.body?.phone || '').replace(/\D/g, '');
     return phone ? `phone:${phone}` : ipKeyGenerator(req, res);
