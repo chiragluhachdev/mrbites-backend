@@ -8,6 +8,9 @@ const publicSettings = (s) => ({
   orderingEnabled: s.orderingEnabled,
   pausedMessage: s.pausedMessage,
   ratingsEnabled: s.ratingsEnabled,
+  // Not sensitive — the app learns the active gateway from create-order anyway,
+  // and the admin dashboard needs it to show the current selection.
+  paymentGateway: s.paymentGateway,
 });
 
 // GET /api/settings — public: the app needs to know whether ordering is live.
@@ -24,11 +27,12 @@ router.get('/', async (req, res) => {
 // PUT /api/settings — admin only.
 router.put('/', requireAdmin, async (req, res) => {
   try {
-    const { orderingEnabled, pausedMessage, ratingsEnabled } = req.body || {};
+    const { orderingEnabled, pausedMessage, ratingsEnabled, paymentGateway } = req.body || {};
     const updates = {};
     if (typeof orderingEnabled === 'boolean') updates.orderingEnabled = orderingEnabled;
     if (typeof ratingsEnabled === 'boolean') updates.ratingsEnabled = ratingsEnabled;
     if (typeof pausedMessage === 'string') updates.pausedMessage = pausedMessage.trim();
+    if (paymentGateway === 'cashfree' || paymentGateway === 'razorpay') updates.paymentGateway = paymentGateway;
 
     if (!Object.keys(updates).length) {
       return res.status(400).json({ message: 'Nothing to update' });

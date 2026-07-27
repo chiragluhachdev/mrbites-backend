@@ -3,9 +3,12 @@ const rateLimit = require('express-rate-limit');
 
 const User = require('../models/User');
 const OrderDraft = require('../models/OrderDraft');
-const { authenticate } = require('../middleware/auth');
+const Settings = require('../models/Settings');
+const PaymentWebhookLog = require('../models/PaymentWebhookLog');
+const { authenticate, requireAdmin } = require('../middleware/auth');
 const { priceCart } = require('../utils/priceCart');
 const { razorpay, isConfigured, key_id } = require('../utils/razorpay');
+const cashfree = require('../utils/cashfree');
 
 const router = express.Router();
 
@@ -46,11 +49,12 @@ const DRAFT_TTL_MS = 30 * 60 * 1000;
  */
 router.post('/create-order', authenticate, perUserPaymentLimiter, async (req, res) => {
   try {
-    if (!isConfigured()) {
+    // Neither gateway configured → nothing can take money.
+    if (!cashfree.isConfigured() && !isConfigured()) {
       return res.status(503).json({ message: 'Payments are not configured right now.' });
     }
 
-    // The demo account must never reach Razorpay — it uses /orders/demo instead.
+    // The demo account must never reach a real gateway — it uses /orders/demo.
     const payer = await User.findById(req.user.id).select('isDemo').lean();
     if (payer?.isDemo) {
       return res.status(409).json({ reason: 'demo_user', message: 'Demo account — use the demo checkout flow instead.' });
@@ -69,16 +73,15 @@ router.post('/create-order', authenticate, perUserPaymentLimiter, async (req, re
     const user = await User.findById(req.user.id).select('name phone').lean();
     if (!user) return res.status(401).json({ message: 'Please sign in again.' });
 
-    const rzpOrder = await razorpay.orders.create({
-      amount: Math.round(priced.total * 100), // paise, from the server's total
-      currency: 'INR',
-      receipt: `mrb_${Date.now()}_${String(user._id).slice(-6)}`,
-      payment_capture: 1,
-      notes: { userId: String(user._id) },
-    });
+    // The admin picks the gateway; fall back to the other if the chosen one has
+    // no keys, so a misconfiguration can never dead-end the checkout.
+    const settings = await Settings.get();
+    let gateway = settings.paymentGateway === 'razorpay' ? 'razorpay' : 'cashfree';
+    if (gateway === 'cashfree' && !cashfree.isConfigured()) gateway = 'razorpay';
+    if (gateway === 'razorpay' && !isConfigured()) gateway = 'cashfree';
 
-    await OrderDraft.create({
-      razorpayOrderId: rzpOrder.id,
+    const receipt = `mrb_${Date.now()}_${String(user._id).slice(-6)}`;
+    const draftBase = {
       userId: user._id,
       // A student who never set a name still needs something on the ticket the
       // counter reads out, so it falls back to "User" rather than a blank.
@@ -88,18 +91,77 @@ router.post('/create-order', authenticate, perUserPaymentLimiter, async (req, re
       pickupType: pickupType === 'PICK_UP' ? 'PICK_UP' : 'DINE_IN',
       notes,
       expiresAt: new Date(Date.now() + DRAFT_TTL_MS),
+    };
+
+    if (gateway === 'cashfree') {
+      const notifyUrl = cashfree.isProd
+        ? process.env.WEBHOOK_URL
+        : process.env.SANDBOX_WEBHOOK_URL || process.env.WEBHOOK_URL;
+
+      const cf = await cashfree.createOrder({
+        orderId: receipt,
+        amount: priced.total, // rupees, from the server's total
+        customer: { id: user._id, phone: user.phone, name: draftBase.customer.name },
+        notifyUrl,
+      });
+
+      await OrderDraft.create({ ...draftBase, gateway: 'cashfree', cashfreeOrderId: cf.orderId });
+
+      return res.json({
+        gateway: 'cashfree',
+        orderId: cf.orderId,
+        paymentSessionId: cf.paymentSessionId,
+        // The app's Cashfree SDK needs to know which environment to talk to.
+        mode: cashfree.isProd ? 'PRODUCTION' : 'SANDBOX',
+        // Echoed so the app can show the authoritative total before paying.
+        total: priced.total,
+      });
+    }
+
+    // ---- Razorpay ----
+    const rzpOrder = await razorpay.orders.create({
+      amount: Math.round(priced.total * 100), // paise, from the server's total
+      currency: 'INR',
+      receipt,
+      payment_capture: 1,
+      notes: { userId: String(user._id) },
     });
 
+    await OrderDraft.create({ ...draftBase, gateway: 'razorpay', razorpayOrderId: rzpOrder.id });
+
     res.json({
+      gateway: 'razorpay',
       order: { id: rzpOrder.id, amount: rzpOrder.amount, currency: rzpOrder.currency },
       key: key_id,
-      // Echoed so the app can show the authoritative total before paying, and
-      // spot a drift from what it had on screen.
       total: priced.total,
     });
   } catch (err) {
     console.error('Create payment order failed', err);
     res.status(500).json({ message: 'Could not start the payment. Please try again.' });
+  }
+});
+
+/**
+ * GET /api/payment/webhook-logs — admin only.
+ *
+ * Recent payment-webhook events, newest first, for debugging. Supports
+ * ?outcome=… and ?orderId=… filters and a capped ?limit.
+ */
+router.get('/webhook-logs', requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 100, 500);
+    const filter = {};
+    if (req.query.outcome) filter.outcome = String(req.query.outcome);
+    if (req.query.orderId) filter.orderId = String(req.query.orderId);
+
+    const logs = await PaymentWebhookLog.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+    res.json({ logs });
+  } catch (err) {
+    console.error('Read webhook logs failed', err);
+    res.status(500).json({ message: 'Could not load webhook logs.' });
   }
 });
 

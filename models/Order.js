@@ -58,8 +58,13 @@ const OrderSchema = new mongoose.Schema({
   // order is paid the moment the vendor completes the sale.
   paidAt: { type: Date, required: true },
   expiresAt: { type: Date }, // Set for ONLINE orders to auto-cancel if unacknowledged
+  // Which gateway took the money (ONLINE only). The ids below live in the
+  // matching pair; the other pair stays unset.
+  gateway: { type: String, enum: ['razorpay', 'cashfree'] },
   razorpayOrderId: { type: String },
   razorpayPaymentId: { type: String },
+  cashfreeOrderId: { type: String },
+  cashfreePaymentId: { type: String },
 
   // Only meaningful for ONLINE. POS orders are created 'settled' with settledAt
   // = paidAt so they never appear as money the platform owes anyone, and admin
@@ -77,6 +82,10 @@ const OrderSchema = new mongoose.Schema({
     enum: ['pending', 'preparing', 'ready', 'delivered', 'cancelled'],
     default: 'pending',
   },
+  // Why an order was cancelled (auto-cancel timeout, vendor, customer). Was set
+  // on the document but not modelled, so Mongoose dropped it and the reason never
+  // persisted past the live socket event — now it's kept for the record.
+  cancellationReason: { type: String },
 }, { timestamps: true });
 
 OrderSchema.index({ 'customer.phone': 1 });
@@ -105,6 +114,12 @@ OrderSchema.index({ restaurantId: 1, source: 1, createdAt: -1 });
 OrderSchema.index(
   { razorpayOrderId: 1, restaurantId: 1 },
   { unique: true, partialFilterExpression: { razorpayOrderId: { $type: 'string' } } }
+);
+// Same guard for the Cashfree lane: one order per (cashfree order, outlet), so a
+// replayed confirm or a webhook racing the app cannot create a second copy.
+OrderSchema.index(
+  { cashfreeOrderId: 1, restaurantId: 1 },
+  { unique: true, partialFilterExpression: { cashfreeOrderId: { $type: 'string' } } }
 );
 
 module.exports = mongoose.model('Order', OrderSchema);

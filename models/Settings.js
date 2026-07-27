@@ -16,6 +16,12 @@ const SettingsSchema = new mongoose.Schema({
   // whatever its own ratingEnabled flag says.
   ratingsEnabled: { type: Boolean, default: true },
 
+  // Which payment gateway the checkout uses, chosen by an admin. Cashfree is
+  // the default/first choice; Razorpay is the fallback. The app never decides
+  // this — it asks create-order, which reads this setting — so flipping it in
+  // the admin dashboard takes effect for the next order without an app update.
+  paymentGateway: { type: String, enum: ['cashfree', 'razorpay'], default: 'cashfree' },
+
   // Demo mode. When on, checkout takes no money: the app shows a confirmation,
   // a marked demo order lands in the customer's history, and nothing reaches
   // Razorpay, the vendor dashboards or the finance figures. Meant for app-store

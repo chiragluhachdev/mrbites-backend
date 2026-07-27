@@ -9,6 +9,7 @@ const { authenticate, requireVendor, requireAdmin, ownsOutlet } = require('../mi
 const { priceOrder } = require('../utils/pricing');
 const { priceCart } = require('../utils/priceCart');
 const { razorpay, verifySignature } = require('../utils/razorpay');
+const cashfree = require('../utils/cashfree');
 
 const VALID_STATUSES = ['pending', 'preparing', 'ready', 'delivered', 'cancelled'];
 
@@ -173,6 +174,98 @@ const emitOrderCreated = (io, order) => {
 };
 
 /**
+ * Turns a paid, verified draft into real orders — idempotently. This is the one
+ * place orders are born from an online payment, called by both the app's
+ * /confirm and the Cashfree webhook, so the two can race without ever making
+ * duplicates. It assumes the caller has already proven the money arrived and the
+ * amount matched; it only handles the claim → create → seal dance.
+ *
+ * `gateway` picks which id fields to write. Returns one of:
+ *   { orders, created:true }     — this call built them
+ *   { orders, idempotent:true }  — already built by an earlier call
+ *   { conflict:true }            — another call is mid-flight; retry shortly
+ */
+async function finalizeDraftToOrders(io, { gateway, gatewayOrderId, paymentId }) {
+  const idField = gateway === 'cashfree' ? 'cashfreeOrderId' : 'razorpayOrderId';
+  const paymentField = gateway === 'cashfree' ? 'cashfreePaymentId' : 'razorpayPaymentId';
+
+  // Claim the draft — only one caller moves it out of awaiting_payment.
+  //
+  // A draft stuck in `consuming` past CONSUMING_STALE_MS is treated as abandoned:
+  // the process that claimed it died between claiming and sealing, which would
+  // otherwise leave a paid order that can never be created (every retry and the
+  // webhook would see `consuming` and back off forever). Reclaiming it is safe —
+  // the unique (gatewayOrderId, restaurantId) index still makes a duplicate order
+  // impossible even in the unlikely event the original finalize is still alive.
+  const CONSUMING_STALE_MS = 2 * 60 * 1000;
+  const claimed = await OrderDraft.findOneAndUpdate(
+    {
+      [idField]: gatewayOrderId,
+      $or: [
+        { status: 'awaiting_payment' },
+        { status: 'consuming', updatedAt: { $lt: new Date(Date.now() - CONSUMING_STALE_MS) } },
+      ],
+    },
+    { status: 'consuming' },
+    { new: true }
+  );
+  if (!claimed) {
+    const fresh = await OrderDraft.findOne({ [idField]: gatewayOrderId });
+    if (fresh?.status === 'consumed') {
+      const orders = await Order.find({ _id: { $in: fresh.orderIds } }).populate('restaurantId', 'name');
+      return { orders, idempotent: true };
+    }
+    return { conflict: true };
+  }
+
+  const paidAt = new Date();
+  const docs = claimed.groups.map((g) => ({
+    restaurantId: g.restaurantId,
+    items: g.items,
+    subtotal: g.subtotal,
+    total: g.total,
+    source: 'ONLINE',
+    gateway,
+    pickupType: claimed.pickupType,
+    notes: claimed.notes,
+    customer: claimed.customer,
+    paidAt,
+    expiresAt: new Date(Date.now() + 300000), // 5 min for the vendor to acknowledge
+    [idField]: gatewayOrderId,
+    [paymentField]: paymentId,
+    settlementStatus: 'pending',
+    status: 'pending',
+  }));
+
+  try {
+    await Order.insertMany(docs, { ordered: false });
+  } catch (err) {
+    // A duplicate key means a racing call already created them — exactly what
+    // the unique index is for. Read them back rather than failing.
+    const duplicate = err?.code === 11000 || err?.writeErrors?.some((e) => e.err?.code === 11000);
+    if (!duplicate) {
+      await OrderDraft.updateOne({ _id: claimed._id }, { status: 'awaiting_payment' });
+      throw err;
+    }
+  }
+
+  const orders = await Order.find({ [idField]: gatewayOrderId }).populate('restaurantId', 'name');
+
+  await OrderDraft.updateOne(
+    { _id: claimed._id },
+    {
+      status: 'consumed',
+      orderIds: orders.map((o) => o._id),
+      [paymentField]: paymentId,
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+    }
+  );
+
+  orders.forEach((o) => emitOrderCreated(io, o));
+  return { orders, created: true };
+}
+
+/**
  * POST /api/orders/confirm — turns a paid draft into real orders.
  *
  * The client sends only Razorpay's three callback fields. Everything the orders
@@ -188,9 +281,58 @@ const emitOrderCreated = (io, order) => {
  *      at the database even if the first two are somehow bypassed.
  */
 router.post('/confirm', authenticate, async (req, res) => {
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+  const body = req.body || {};
+  const io = req.app.get('io');
+  const gateway = body.gateway === 'cashfree' ? 'cashfree' : 'razorpay';
 
   try {
+    if (gateway === 'cashfree') {
+      // ---- Cashfree ----
+      // The app sends only the Cashfree order id; the money is proven by asking
+      // Cashfree, never by trusting the client.
+      const cashfreeOrderId = body.orderId || body.cashfreeOrderId || body.order_id;
+      if (!cashfreeOrderId) {
+        return res.status(400).json({ message: 'Payment could not be verified.' });
+      }
+
+      const draft = await OrderDraft.findOne({ cashfreeOrderId });
+      if (!draft) {
+        return res.status(404).json({ message: 'We could not find this payment. Contact support if you were charged.' });
+      }
+      if (String(draft.userId) !== String(req.user.id)) {
+        return res.status(403).json({ message: 'This payment belongs to another account.' });
+      }
+      if (draft.status === 'consumed') {
+        const orders = await Order.find({ _id: { $in: draft.orderIds } }).populate('restaurantId', 'name');
+        return res.json({ orders, idempotent: true });
+      }
+
+      // Authoritative status straight from Cashfree.
+      const cfOrder = await cashfree.getOrder(cashfreeOrderId);
+      if (cfOrder?.order_status !== 'PAID') {
+        // Not paid yet, dropped, or failed. Create nothing — if it does pay, the
+        // webhook finalises it, so the order still lands without the app.
+        return res.status(402).json({ message: 'Payment has not completed. Nothing was ordered.' });
+      }
+      if (Math.round(Number(cfOrder.order_amount) * 100) !== Math.round(draft.total * 100)) {
+        console.error('Cashfree amount mismatch', { cashfreeOrderId, paid: cfOrder.order_amount, expected: draft.total });
+        return res.status(400).json({ message: 'Payment amount did not match the order.' });
+      }
+
+      const result = await finalizeDraftToOrders(io, {
+        gateway: 'cashfree',
+        gatewayOrderId: cashfreeOrderId,
+        paymentId: body.paymentId || null,
+      });
+      if (result.conflict) {
+        return res.status(409).json({ message: 'This order is already being placed. Please wait a moment.' });
+      }
+      return res.status(result.idempotent ? 200 : 201).json({ orders: result.orders, idempotent: !!result.idempotent });
+    }
+
+    // ---- Razorpay (behaviour unchanged) ----
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = body;
+
     // 1. Is this really from Razorpay?
     if (!verifySignature({ razorpay_order_id, razorpay_payment_id, razorpay_signature })) {
       return res.status(400).json({ message: 'Payment could not be verified.' });
@@ -226,74 +368,18 @@ router.post('/confirm', authenticate, async (req, res) => {
       return res.status(400).json({ message: 'Payment amount did not match the order.' });
     }
 
-    // 5. Claim the draft. Only one request wins this.
-    const claimed = await OrderDraft.findOneAndUpdate(
-      { razorpayOrderId: razorpay_order_id, status: 'awaiting_payment' },
-      { status: 'consuming' },
-      { new: true }
-    );
-    if (!claimed) {
-      // Another call is mid-flight, or just finished.
-      const fresh = await OrderDraft.findOne({ razorpayOrderId: razorpay_order_id });
-      if (fresh?.status === 'consumed') {
-        const orders = await Order.find({ _id: { $in: fresh.orderIds } }).populate('restaurantId', 'name');
-        return res.json({ orders, idempotent: true });
-      }
+    // 5-8. Claim, build one order per outlet, seal the draft, notify the vendor.
+    const result = await finalizeDraftToOrders(io, {
+      gateway: 'razorpay',
+      gatewayOrderId: razorpay_order_id,
+      paymentId: razorpay_payment_id,
+    });
+    if (result.conflict) {
       return res.status(409).json({ message: 'This order is already being placed. Please wait a moment.' });
     }
-
-    // 6. Build one order per outlet, entirely from the draft.
-    const paidAt = new Date();
-    const docs = claimed.groups.map((g) => ({
-      restaurantId: g.restaurantId,
-      items: g.items,
-      subtotal: g.subtotal,
-      total: g.total,
-      source: 'ONLINE',
-      pickupType: claimed.pickupType,
-      notes: claimed.notes,
-      customer: claimed.customer,
-      paidAt,
-      expiresAt: new Date(Date.now() + 120000),
-      razorpayOrderId: razorpay_order_id,
-      razorpayPaymentId: razorpay_payment_id,
-      settlementStatus: 'pending',
-      status: 'pending',
-    }));
-
-    try {
-      await Order.insertMany(docs, { ordered: false });
-    } catch (err) {
-      // A duplicate key here means a racing call already created them, which is
-      // exactly what the index is for — read them back rather than failing.
-      const duplicate = err?.code === 11000 || err?.writeErrors?.some((e) => e.err?.code === 11000);
-      if (!duplicate) {
-        // Release the claim so a retry can pick it up.
-        await OrderDraft.updateOne({ _id: claimed._id }, { status: 'awaiting_payment' });
-        throw err;
-      }
-    }
-
-    const orders = await Order.find({ razorpayOrderId: razorpay_order_id }).populate('restaurantId', 'name');
-
-    // 7. Seal the draft, and keep it around long enough to answer a late retry.
-    await OrderDraft.updateOne(
-      { _id: claimed._id },
-      {
-        status: 'consumed',
-        orderIds: orders.map((o) => o._id),
-        razorpayPaymentId: razorpay_payment_id,
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-      }
-    );
-
-    // 8. Only now does the vendor learn of it — payment is fully verified.
-    const io = req.app.get('io');
-    orders.forEach((o) => emitOrderCreated(io, o));
-
-    res.status(201).json({ orders });
+    return res.status(result.idempotent ? 200 : 201).json({ orders: result.orders, idempotent: !!result.idempotent });
   } catch (err) {
-    console.error('Confirm order failed', { razorpay_order_id, err });
+    console.error('Confirm order failed', { gateway, err });
     res.status(500).json({ message: 'We could not place your order. If you were charged, it will be retried automatically.' });
   }
 });
@@ -333,7 +419,7 @@ router.post('/demo', authenticate, async (req, res) => {
       notes: req.body?.notes,
       customer,
       paidAt: now,
-      expiresAt: new Date(Date.now() + 120000),
+      expiresAt: new Date(Date.now() + 300000), // 5 min for the vendor to acknowledge
       // Settled with no obligation, belt-and-braces alongside the isDemo filters,
       // so a demo order can never read as money owed even if a filter is missed.
       settlementStatus: 'settled',
@@ -475,5 +561,8 @@ router.get('/', requireAdmin, async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 });
+
+// Shared with the Cashfree webhook route, which finalises the same drafts.
+router.finalizeDraftToOrders = finalizeDraftToOrders;
 
 module.exports = router;

@@ -2,7 +2,7 @@ const Order = require('../models/Order');
 
 /**
  * Runs continuously in the background to automatically cancel pending orders
- * that the vendor has not acknowledged within the expiresAt timeframe (2 mins).
+ * that the vendor has not acknowledged within the expiresAt timeframe (5 mins).
  * 
  * @param {import('socket.io').Server} io - The socket instance for emitting updates
  */

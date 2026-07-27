@@ -26,6 +26,8 @@ const authRouter = require('./routes/auth');
 const restaurantsRouter = require('./routes/restaurants');
 const usersRouter = require('./routes/users');
 const paymentRouter = require('./routes/payment');
+const cashfreeWebhookRouter = require('./routes/cashfreeWebhook');
+const razorpayWebhookRouter = require('./routes/razorpayWebhook');
 const uploadRouter = require('./routes/upload');
 const financeRouter = require('./routes/finance');
 const settingsRouter = require('./routes/settings');
@@ -80,6 +82,13 @@ app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 
 /* ------------------ MIDDLEWARE ------------------ */
+// The Cashfree webhook is mounted BEFORE express.json with a raw body parser:
+// its signature is computed over the exact bytes Cashfree sent, so the body must
+// not be parsed-and-reserialised first. It responds itself, so it never falls
+// through to the JSON parser below.
+app.use('/api/payments/cashfree/webhook', express.raw({ type: '*/*', limit: '100kb' }), cashfreeWebhookRouter);
+app.use('/api/payments/razorpay/webhook', express.raw({ type: '*/*', limit: '100kb' }), razorpayWebhookRouter);
+
 app.use(express.json({ limit: '100kb' }));
 
 // Behind a proxy (Render, nginx) the client IP arrives in X-Forwarded-For.

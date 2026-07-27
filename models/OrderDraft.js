@@ -39,9 +39,16 @@ const DraftGroupSchema = new mongoose.Schema({
 }, { _id: false });
 
 const OrderDraftSchema = new mongoose.Schema({
-  razorpayOrderId: { type: String, required: true, unique: true },
+  // Which gateway this draft was quoted through. The order id below lives in
+  // the matching field, and confirmation reads back through the same one.
+  gateway: { type: String, enum: ['razorpay', 'cashfree'], default: 'razorpay' },
+  // Exactly one of these is set, per `gateway`. Both are optional at the schema
+  // level and made unique only when present (partial indexes below), so the two
+  // gateways never collide on each other's null.
+  razorpayOrderId: { type: String },
+  cashfreeOrderId: { type: String },
   // Whose cart this is. Confirmation is refused for anyone else, so a leaked
-  // razorpay order id cannot be redeemed by another account.
+  // gateway order id cannot be redeemed by another account.
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   customer: {
     name: String,
@@ -66,6 +73,7 @@ const OrderDraftSchema = new mongoose.Schema({
   // instead of creating more.
   orderIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Order' }],
   razorpayPaymentId: { type: String },
+  cashfreePaymentId: { type: String },
 
   // Unpaid drafts are litter and expire quickly; consumed ones are kept long
   // enough to answer a late retry, then swept.
@@ -75,5 +83,16 @@ const OrderDraftSchema = new mongoose.Schema({
 // TTL: Mongo removes the document once expiresAt passes.
 OrderDraftSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 OrderDraftSchema.index({ userId: 1, createdAt: -1 });
+// One draft per gateway order id. Partial, so a cashfree draft (no
+// razorpayOrderId) and a razorpay draft (no cashfreeOrderId) never collide on
+// each other's absent field.
+OrderDraftSchema.index(
+  { razorpayOrderId: 1 },
+  { unique: true, partialFilterExpression: { razorpayOrderId: { $type: 'string' } } }
+);
+OrderDraftSchema.index(
+  { cashfreeOrderId: 1 },
+  { unique: true, partialFilterExpression: { cashfreeOrderId: { $type: 'string' } } }
+);
 
 module.exports = mongoose.model('OrderDraft', OrderDraftSchema);
