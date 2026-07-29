@@ -361,11 +361,13 @@ router.post('/:id/menu/items', requireVendor, async (req, res) => {
     });
 
     await item.save();
-    // Emit menu update to restaurant room if Socket.IO available
+    // Broadcast the menu change publicly (menu content is public, unlike order
+    // events) so customers viewing this outlet's menu see it live. The
+    // restaurantId lets each client refresh only the outlet it's looking at.
     try {
       const io = req.app.get('io');
       if (io) {
-        io.to(`restaurant:${restaurant._id}`).emit('menu.updated', { action: 'created', item: { id: item._id, name: item.name, price: item.price, description: item.description, category: item.category } });
+        io.emit('menu.updated', { action: 'created', restaurantId: String(restaurant._id), item: { id: item._id, name: item.name, price: item.price, description: item.description, category: item.category } });
       }
     } catch (emitErr) {
       console.warn('Emit menu.created failed', emitErr);
@@ -396,8 +398,7 @@ router.put('/menu/items/:itemId', requireVendor, async (req, res) => {
       const io = req.app.get('io');
       if (io) {
         const rid = item.restaurant || null;
-        if (rid) io.to(`restaurant:${rid}`).emit('menu.updated', { action: 'updated', item: { id: item._id, name: item.name, available: item.available } });
-        else io.emit('menu.updated', { action: 'updated', item: { id: item._id, name: item.name, available: item.available } });
+        io.emit('menu.updated', { action: 'updated', restaurantId: rid ? String(rid) : null, item: { id: item._id, name: item.name, available: item.available } });
       }
     } catch (emitErr) {
       console.warn('Emit menu.updated failed', emitErr);
@@ -424,10 +425,8 @@ router.delete('/menu/items/:itemId', requireVendor, async (req, res) => {
     try {
       const io = req.app.get('io');
       if (io) {
-        // If item had restaurant ref, use it; otherwise broadcast generically
         const rid = item.restaurant || req.params.restaurantId || null;
-        if (rid) io.to(`restaurant:${rid}`).emit('menu.updated', { action: 'deleted', itemId: req.params.itemId });
-        else io.emit('menu.updated', { action: 'deleted', itemId: req.params.itemId });
+        io.emit('menu.updated', { action: 'deleted', restaurantId: rid ? String(rid) : null, itemId: req.params.itemId });
       }
     } catch (emitErr) {
       console.warn('Emit menu.deleted failed', emitErr);
