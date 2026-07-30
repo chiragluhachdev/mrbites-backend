@@ -28,6 +28,12 @@ const SettingsSchema = new mongoose.Schema({
   // review and staged demos, so reviewers can walk the whole flow without a real
   // card. Off by default; a normal launch never touches it.
   demoMode: { type: Boolean, default: false },
+
+  // Minimum supported app version for Force Update functionality
+  minAppVersion: { type: String, default: '1.0.0' },
+  
+  // Message to display when the user's app is outdated
+  updateMessage: { type: String, default: 'Please update MR BITES to the latest version for the best experience.' },
 }, { timestamps: true });
 
 /** Reads the singleton, creating it the first time. */
