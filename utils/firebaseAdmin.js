@@ -2,8 +2,16 @@
 // in this codebase pick up their credentials from env vars rather than a
 // committed file. Nothing here runs until a push is actually sent, so a
 // misconfigured/missing credential never blocks server startup.
+//
+// firebase-admin v13+ is modular: credentials come from `firebase-admin/app`
+// (`initializeApp`/`cert`) and messaging from `firebase-admin/messaging`. The
+// old namespaced form (`admin.credential.cert`, `admin.messaging()`) no longer
+// exists on the root export.
 
-const admin = require('firebase-admin');
+const { initializeApp, getApps, cert } = require('firebase-admin/app');
+const { getMessaging: getAdminMessaging } = require('firebase-admin/messaging');
+
+const APP_NAME = 'mrbites-push';
 
 let app = null;
 
@@ -20,14 +28,15 @@ function getApp() {
     throw new Error('Firebase Admin is not configured — set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY.');
   }
 
-  app = admin.initializeApp({
-    credential: admin.credential.cert({ projectId, clientEmail, privateKey }),
-  });
+  // Named app so this can't collide with any default app another dependency
+  // might initialise, and so a hot-reload doesn't throw "already exists".
+  const existing = getApps().find((a) => a.name === APP_NAME);
+  app = existing || initializeApp({ credential: cert({ projectId, clientEmail, privateKey }) }, APP_NAME);
   return app;
 }
 
 function getMessaging() {
-  return admin.messaging(getApp());
+  return getAdminMessaging(getApp());
 }
 
 // True once the required env vars are present, without throwing — lets

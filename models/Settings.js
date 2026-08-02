@@ -1,5 +1,15 @@
 const mongoose = require('mongoose');
 
+// One editable push template. `{outlet}`, `{code}` and `{amount}` are
+// substituted at send time; `enabled: false` silences that stage without
+// affecting the others.
+const pushTemplate = (title, body) => ({
+  enabled: { type: Boolean, default: true },
+  title: { type: String, default: title },
+  body: { type: String, default: body },
+  _id: false,
+});
+
 // A single platform-wide settings document. There is only ever one row; it is
 // created on first read.
 const SettingsSchema = new mongoose.Schema({
@@ -34,6 +44,25 @@ const SettingsSchema = new mongoose.Schema({
   
   // Message to display when the user's app is outdated
   updateMessage: { type: String, default: 'Please update MR BITES to the latest version for the best experience.' },
+
+  // The push a customer gets at each stage of their order, editable from the
+  // admin console so the wording can change without an app or server release.
+  // Defaults reproduce exactly what used to be hardcoded, so an untouched
+  // deployment behaves identically.
+  //
+  // `ready` is split because a dine-in customer and a takeaway customer need
+  // different instructions. `cancelled` is one template: only ONLINE orders
+  // reach a customer's device in practice, and those always carry a refund.
+  orderNotifications: {
+    // Master switch for all six — leaves admin broadcasts untouched.
+    enabled: { type: Boolean, default: true },
+    pending: pushTemplate('Order Confirmed! 🎉', 'Your order from {outlet} has been placed.'),
+    preparing: pushTemplate('Order Being Prepared 👨‍🍳', '{outlet} has started preparing your order.'),
+    readyDineIn: pushTemplate('Order Ready! ✅', 'Your order from {outlet} is ready — enjoy your meal!'),
+    readyPickup: pushTemplate('Order Ready! ✅', 'Your order from {outlet} is ready for pickup.'),
+    delivered: pushTemplate('Order Delivered', 'Your order from {outlet} has been delivered. Enjoy!'),
+    cancelled: pushTemplate('Order Cancelled', 'Your order from {outlet} was cancelled. Your payment will be refunded within 12 hours.'),
+  },
 }, { timestamps: true });
 
 /** Reads the singleton, creating it the first time. */

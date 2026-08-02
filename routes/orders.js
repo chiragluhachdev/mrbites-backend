@@ -11,6 +11,7 @@ const { priceCart } = require('../utils/priceCart');
 const { razorpay, verifySignature } = require('../utils/razorpay');
 const cashfree = require('../utils/cashfree');
 const { notifyByPhone } = require('../utils/pushNotify');
+const { resolveOrderPushCopy } = require('../utils/orderPushCopy');
 
 const VALID_STATUSES = ['pending', 'preparing', 'ready', 'delivered', 'cancelled'];
 
@@ -187,46 +188,31 @@ const emitOrderCreated = (io, order) => {
   }
 };
 
-// Wording per lifecycle stage — kept together so the copy for every push a
-// customer can get about one order lives in one place. `pending` here means
-// "just placed", i.e. the order-confirmed push, not a later re-check.
-const ORDER_PUSH_COPY = {
-  pending: (outlet) => ({ title: 'Order Confirmed! 🎉', body: `Your order from ${outlet} has been placed.` }),
-  preparing: (outlet) => ({ title: 'Order Being Prepared 👨‍🍳', body: `${outlet} has started preparing your order.` }),
-  ready: (outlet, pickupType) => ({
-    title: 'Order Ready! ✅',
-    body: pickupType === 'DINE_IN' ? `Your order from ${outlet} is ready — enjoy your meal!` : `Your order from ${outlet} is ready for pickup.`,
-  }),
-  delivered: (outlet) => ({ title: 'Order Delivered', body: `Your order from ${outlet} has been delivered. Enjoy!` }),
-  cancelled: (outlet, _pickupType, refundPending) => ({
-    title: 'Order Cancelled',
-    body: refundPending
-      ? `Your order from ${outlet} was cancelled. Your payment will be refunded within 12 hours.`
-      : `Your order from ${outlet} was cancelled.`,
-  }),
-};
-
 /**
- * Sends the customer-facing push for an order's current stage. Best-effort —
- * a notification failure must never fail order creation/status changes, so
- * this only logs and never throws into the caller.
+ * Sends the customer-facing push for an order's current stage. The wording
+ * comes from the admin-editable templates on Settings (see
+ * utils/orderPushCopy.js), which also decides whether this stage is switched
+ * on at all — a disabled stage resolves to null and nothing is sent.
+ *
+ * Fire-and-forget: a notification failure must never fail order creation or a
+ * status change, so nothing here is awaited and nothing throws into the caller.
  */
 function pushOrderStatus(order, status) {
-  try {
-    const copyFn = ORDER_PUSH_COPY[status];
-    if (!copyFn || !order?.customer?.phone) return;
-    const outlet = order.restaurantId?.name || 'the outlet';
-    const refundPending = status === 'cancelled' && order.source === 'ONLINE';
-    const { title, body } = copyFn(outlet, order.pickupType, refundPending);
-    const restaurantId = order.restaurantId?._id || order.restaurantId;
-    notifyByPhone(order.customer.phone, {
-      title,
-      body,
-      data: { type: `order_${status}`, orderId: String(order._id), vendorId: String(restaurantId), screen: 'order' },
-    }).catch((err) => console.error('[push] order status notify failed', err.message));
-  } catch (err) {
-    console.error('[push] pushOrderStatus error', err.message);
-  }
+  if (!order?.customer?.phone) return;
+  (async () => {
+    try {
+      const copy = await resolveOrderPushCopy(order, status);
+      if (!copy) return; // stage (or the whole feature) turned off by the admin
+      const restaurantId = order.restaurantId?._id || order.restaurantId;
+      await notifyByPhone(order.customer.phone, {
+        title: copy.title,
+        body: copy.body,
+        data: { type: `order_${status}`, orderId: String(order._id), vendorId: String(restaurantId), screen: 'order' },
+      });
+    } catch (err) {
+      console.error('[push] order status notify failed', err.message);
+    }
+  })();
 }
 
 /**
