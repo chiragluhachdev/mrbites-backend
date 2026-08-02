@@ -7,6 +7,10 @@ const Order = require('../models/Order');
  * @param {import('socket.io').Server} io - The socket instance for emitting updates
  */
 function startOrderScheduler(io) {
+  // Required lazily to avoid a load-order dependency between the two route
+  // modules — same reasoning as notificationScheduler.js.
+  const { pushOrderStatus } = require('../routes/orders');
+
   // Run every 15 seconds
   setInterval(async () => {
     try {
@@ -15,7 +19,7 @@ function startOrderScheduler(io) {
       const expiredOrders = await Order.find({
         status: 'pending',
         expiresAt: { $lt: now }
-      });
+      }).populate('restaurantId', 'name');
 
       if (expiredOrders.length === 0) return;
 
@@ -29,20 +33,22 @@ function startOrderScheduler(io) {
         await order.save();
 
         // Emit to the customer that their order was cancelled
-        io.emit('order.statusChanged', { 
-          orderId: order._id, 
+        io.emit('order.statusChanged', {
+          orderId: order._id,
           status: 'cancelled',
           reason: order.cancellationReason
         });
 
         // Emit to the vendor dashboard to remove/update it from their screen
-        io.to(`restaurant:${order.restaurantId}`).emit('order.statusChanged', { 
-          orderId: order._id, 
+        io.to(`restaurant:${order.restaurantId._id || order.restaurantId}`).emit('order.statusChanged', {
+          orderId: order._id,
           status: 'cancelled',
           reason: order.cancellationReason
         });
+
+        if (!order.isDemo) pushOrderStatus(order, 'cancelled');
       }
-      
+
       console.log(`[OrderScheduler] Auto-cancelled ${expiredOrders.length} expired orders.`);
     } catch (err) {
       console.error('[OrderScheduler] Error checking for expired orders:', err);

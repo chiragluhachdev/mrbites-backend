@@ -10,6 +10,7 @@ const { priceOrder } = require('../utils/pricing');
 const { priceCart } = require('../utils/priceCart');
 const { razorpay, verifySignature } = require('../utils/razorpay');
 const cashfree = require('../utils/cashfree');
+const { notifyByPhone } = require('../utils/pushNotify');
 
 const VALID_STATUSES = ['pending', 'preparing', 'ready', 'delivered', 'cancelled'];
 
@@ -74,7 +75,7 @@ router.patch('/:id/status', requireVendor, async (req, res) => {
       { _id: req.params.id, status: existing.status },
       update,
       { new: true }
-    );
+    ).populate('restaurantId', 'name');
     if (!order) {
       return res.status(409).json({ message: 'That order was just updated elsewhere. Refresh and try again.' });
     }
@@ -83,11 +84,15 @@ router.patch('/:id/status', requireVendor, async (req, res) => {
     try {
       const io = req.app.get('io');
       if (io && order.restaurantId) {
-        io.to(`restaurant:${order.restaurantId}`).emit('order.statusChanged', { orderId: order._id, status });
+        io.to(`restaurant:${order.restaurantId._id || order.restaurantId}`).emit('order.statusChanged', { orderId: order._id, status });
       }
     } catch (emitErr) {
       console.warn('Emit order.statusChanged failed', emitErr);
     }
+
+    // A demo order never reaches a real customer's device with real intent —
+    // it's excluded from every other real-world signal too (see /demo above).
+    if (!order.isDemo) pushOrderStatus(order, status);
 
     res.json({ order });
   } catch (err) {
@@ -182,6 +187,48 @@ const emitOrderCreated = (io, order) => {
   }
 };
 
+// Wording per lifecycle stage — kept together so the copy for every push a
+// customer can get about one order lives in one place. `pending` here means
+// "just placed", i.e. the order-confirmed push, not a later re-check.
+const ORDER_PUSH_COPY = {
+  pending: (outlet) => ({ title: 'Order Confirmed! 🎉', body: `Your order from ${outlet} has been placed.` }),
+  preparing: (outlet) => ({ title: 'Order Being Prepared 👨‍🍳', body: `${outlet} has started preparing your order.` }),
+  ready: (outlet, pickupType) => ({
+    title: 'Order Ready! ✅',
+    body: pickupType === 'DINE_IN' ? `Your order from ${outlet} is ready — enjoy your meal!` : `Your order from ${outlet} is ready for pickup.`,
+  }),
+  delivered: (outlet) => ({ title: 'Order Delivered', body: `Your order from ${outlet} has been delivered. Enjoy!` }),
+  cancelled: (outlet, _pickupType, refundPending) => ({
+    title: 'Order Cancelled',
+    body: refundPending
+      ? `Your order from ${outlet} was cancelled. Your payment will be refunded within 12 hours.`
+      : `Your order from ${outlet} was cancelled.`,
+  }),
+};
+
+/**
+ * Sends the customer-facing push for an order's current stage. Best-effort —
+ * a notification failure must never fail order creation/status changes, so
+ * this only logs and never throws into the caller.
+ */
+function pushOrderStatus(order, status) {
+  try {
+    const copyFn = ORDER_PUSH_COPY[status];
+    if (!copyFn || !order?.customer?.phone) return;
+    const outlet = order.restaurantId?.name || 'the outlet';
+    const refundPending = status === 'cancelled' && order.source === 'ONLINE';
+    const { title, body } = copyFn(outlet, order.pickupType, refundPending);
+    const restaurantId = order.restaurantId?._id || order.restaurantId;
+    notifyByPhone(order.customer.phone, {
+      title,
+      body,
+      data: { type: `order_${status}`, orderId: String(order._id), vendorId: String(restaurantId), screen: 'order' },
+    }).catch((err) => console.error('[push] order status notify failed', err.message));
+  } catch (err) {
+    console.error('[push] pushOrderStatus error', err.message);
+  }
+}
+
 /**
  * Turns a paid, verified draft into real orders — idempotently. This is the one
  * place orders are born from an online payment, called by both the app's
@@ -270,7 +317,10 @@ async function finalizeDraftToOrders(io, { gateway, gatewayOrderId, paymentId })
     }
   );
 
-  orders.forEach((o) => emitOrderCreated(io, o));
+  orders.forEach((o) => {
+    emitOrderCreated(io, o);
+    pushOrderStatus(o, 'pending');
+  });
   return { orders, created: true };
 }
 
@@ -644,5 +694,7 @@ router.patch('/:id/refund', requireAdmin, async (req, res) => {
 
 // Shared with the Cashfree webhook route, which finalises the same drafts.
 router.finalizeDraftToOrders = finalizeDraftToOrders;
+// Shared with orderScheduler.js, which cancels expired orders on the same terms.
+router.pushOrderStatus = pushOrderStatus;
 
 module.exports = router;

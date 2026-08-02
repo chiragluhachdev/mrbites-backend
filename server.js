@@ -19,6 +19,7 @@ const rateLimit = require('express-rate-limit');
 const { ipKeyGenerator } = require('express-rate-limit');
 const { verifyToken, ownsOutlet } = require('./middleware/auth');
 const { startOrderScheduler } = require('./utils/orderScheduler');
+const { startNotificationScheduler } = require('./utils/notificationScheduler');
 
 // Import routers
 const ordersRouter = require('./routes/orders');
@@ -31,6 +32,7 @@ const razorpayWebhookRouter = require('./routes/razorpayWebhook');
 const uploadRouter = require('./routes/upload');
 const financeRouter = require('./routes/finance');
 const settingsRouter = require('./routes/settings');
+const notificationsRouter = require('./routes/notifications');
 const { isDemoPhone } = require('./utils/demo');
 
 const app = express();
@@ -213,6 +215,7 @@ app.use('/api/payment', paymentRouter);
 app.use('/api/upload', uploadRouter);
 app.use('/api/finance', financeRouter);
 app.use('/api/settings', settingsRouter);
+app.use('/api/notifications', notificationsRouter);
 
 /* ------------------ ERRORS ------------------ */
 
@@ -317,6 +320,8 @@ mongoose
     
     // Start the background worker for auto-cancelling expired orders
     startOrderScheduler(io);
+    // Start the background worker for scheduled admin notification broadcasts
+    startNotificationScheduler();
 
     server.listen(PORT, '0.0.0.0', () => {
       console.log(`🚀 Server running on port ${PORT}`);

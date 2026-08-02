@@ -114,16 +114,25 @@ router.delete('/me', authenticate, async (req, res) => {
 // The number is taken from the token, never the body. Previously the body named
 // the account, unauthenticated: anyone could point a stranger's notifications at
 // their own device, and the 404-vs-200 answer told them which numbers existed.
+//
+// One user can hold several device tokens (phone + tablet, or a reinstall that
+// gets a fresh token) — this upserts by token value so registering the same
+// device twice is a no-op rather than a duplicate entry, and re-registering
+// just refreshes updatedAt.
 router.post('/push-token', authenticate, async (req, res) => {
   try {
-    const { token } = req.body || {};
+    const { token, platform } = req.body || {};
     if (!token || typeof token !== 'string') return res.status(400).json({ message: 'Missing token' });
 
+    await User.updateOne(
+      { _id: req.user.id },
+      { $pull: { pushTokens: { token } } }
+    );
     const user = await User.findByIdAndUpdate(
       req.user.id,
-      { pushToken: token },
+      { $push: { pushTokens: { token, platform: platform === 'ios' ? 'ios' : 'android', updatedAt: new Date() } } },
       { new: true }
-    ).select('-password -pushToken');
+    ).select('-password -pushTokens');
 
     if (!user) return res.status(404).json({ message: 'User not found' });
     res.json({ user });
@@ -133,10 +142,40 @@ router.post('/push-token', authenticate, async (req, res) => {
   }
 });
 
-// GET /api/users - list users (for admin)
+// DELETE /api/users/push-token — drop this one device (called on logout, so a
+// signed-out phone stops receiving another account's order updates once
+// someone else signs in on it).
+router.delete('/push-token', authenticate, async (req, res) => {
+  try {
+    const { token } = req.body || {};
+    if (!token || typeof token !== 'string') return res.status(400).json({ message: 'Missing token' });
+
+    await User.updateOne({ _id: req.user.id }, { $pull: { pushTokens: { token } } });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Failed to unregister push token', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// GET /api/users - list users (for admin). `search` (name or phone, optional)
+// backs the notification composer's "selected users" picker.
 router.get('/', requireAdmin, async (req, res) => {
   try {
-    const users = await User.find().select('-password').sort({ createdAt: -1 });
+    const filter = {};
+    const search = (req.query.search || '').trim();
+    if (search) {
+      filter.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { phone: { $regex: search, $options: 'i' } },
+      ];
+    }
+    // The existing (no-search) admin call reads every user — AdminUsers.js shows
+    // that count as "Total", so it must stay unpaginated. A search narrows the
+    // result on its own; the cap there is just a sane ceiling for a picker UI.
+    let query = User.find(filter).select('-password -pushTokens').sort({ createdAt: -1 });
+    if (search) query = query.limit(200);
+    const users = await query;
     res.json({ users });
   } catch (err) {
     console.error('Failed to fetch users', err);
