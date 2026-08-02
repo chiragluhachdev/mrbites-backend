@@ -581,8 +581,11 @@ router.get('/cancelled', requireAdmin, async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit) || 30, 100);
     const skip = (page - 1) * limit;
 
-    const filter = { status: 'cancelled', isDemo: { $ne: true } };
-    if (['pending', 'refunded', 'not_applicable'].includes(req.query.refundStatus)) {
+    // POS cancellations never held platform money — that's the vendor's own
+    // business, settled at their counter — so this refund queue only ever
+    // deals with ONLINE cancellations.
+    const filter = { status: 'cancelled', source: 'ONLINE', isDemo: { $ne: true } };
+    if (['pending', 'refunded'].includes(req.query.refundStatus)) {
       filter.refundStatus = req.query.refundStatus;
     }
     const search = (req.query.search || '').trim();
