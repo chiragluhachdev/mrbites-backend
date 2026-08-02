@@ -513,7 +513,10 @@ router.get('/mine', authenticate, async (req, res) => {
     const orders = await Order.find({ 'customer.phone': user.phone })
       .sort({ createdAt: -1 })
       .limit(limit)
-      .populate('restaurantId', 'name location')
+      // contactPhone lets the app offer a "call the outlet" option on each
+      // order — admin-entered, so it's blank for some outlets, and the app
+      // handles that by simply not showing the option there.
+      .populate('restaurantId', 'name location contactPhone')
       .populate('items.itemId', 'image imageUrl');
     res.json({ orders });
   } catch (err) {
