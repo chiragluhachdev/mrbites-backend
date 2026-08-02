@@ -86,6 +86,20 @@ const OrderSchema = new mongoose.Schema({
   // on the document but not modelled, so Mongoose dropped it and the reason never
   // persisted past the live socket event — now it's kept for the record.
   cancellationReason: { type: String },
+
+  // Refunds are manual (no gateway auto-refund integration) — this is the
+  // admin's tracking of that manual work, not something the platform acts on.
+  // Only ever meaningful for a cancelled ONLINE order (real money was taken by
+  // the platform); a POS order's money went straight to the vendor, so it stays
+  // 'not_applicable'. Set to 'pending' the moment such an order is cancelled —
+  // by a vendor, an admin, or the auto-cancel scheduler — so the admin console
+  // has a queue of what still needs refunding, and can mark it done once the
+  // refund is issued through the gateway's own dashboard.
+  refundStatus: { type: String, enum: ['not_applicable', 'pending', 'refunded'], default: 'not_applicable' },
+  refundedAt: { type: Date },
+  // Free-text reference the admin leaves when marking a refund done (a UTR, a
+  // gateway refund id, a note) — there only for their own audit trail.
+  refundNote: { type: String },
 }, { timestamps: true });
 
 OrderSchema.index({ 'customer.phone': 1 });

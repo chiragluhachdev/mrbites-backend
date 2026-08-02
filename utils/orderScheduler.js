@@ -22,6 +22,10 @@ function startOrderScheduler(io) {
       for (const order of expiredOrders) {
         order.status = 'cancelled';
         order.cancellationReason = 'Auto-cancelled: Outlet did not respond in time';
+        // These are always paid ONLINE orders (only ONLINE orders carry
+        // expiresAt), so the platform is holding money that needs refunding —
+        // queue it for the admin same as any other cancellation.
+        order.refundStatus = 'pending';
         await order.save();
 
         // Emit to the customer that their order was cancelled

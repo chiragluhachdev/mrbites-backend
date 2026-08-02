@@ -38,7 +38,7 @@ router.patch('/:id/status', requireVendor, async (req, res) => {
     }
 
     // A vendor may only move its own outlet's orders.
-    const existing = await Order.findById(req.params.id).select('restaurantId status');
+    const existing = await Order.findById(req.params.id).select('restaurantId status source');
     if (!existing) return res.status(404).json({ message: 'Order not found' });
     if (!ownsOutlet(req.user, existing.restaurantId)) {
       return res.status(403).json({ message: 'You can only manage your own orders' });
@@ -58,12 +58,21 @@ router.patch('/:id/status', requireVendor, async (req, res) => {
       });
     }
 
+    // Cancelling an ONLINE order means the platform is holding money that must
+    // go back to the customer — flag it so it lands in the admin's refund
+    // queue. A POS sale was paid straight to the vendor, so the platform never
+    // held it and there's nothing to refund from this side.
+    const update = { status };
+    if (status === 'cancelled' && existing.source === 'ONLINE') {
+      update.refundStatus = 'pending';
+    }
+
     // Conditional on the status we just read: if another device moved this order
     // in between, that update is not overwritten — it loses the race cleanly
     // rather than silently clobbering.
     const order = await Order.findOneAndUpdate(
       { _id: req.params.id, status: existing.status },
-      { status },
+      update,
       { new: true }
     );
     if (!order) {
@@ -556,6 +565,71 @@ router.get('/', requireAdmin, async (req, res) => {
       .sort({ createdAt: -1 })
       .populate('restaurantId', 'name');
     res.json({ orders });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// GET /api/orders/cancelled — every cancelled order, admin only. This is the
+// refund queue: an ONLINE cancellation means the platform is still holding the
+// customer's money, and refundStatus tracks whether that's been sorted out
+// manually through the gateway's own dashboard.
+router.get('/cancelled', requireAdmin, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 30, 100);
+    const skip = (page - 1) * limit;
+
+    const filter = { status: 'cancelled', isDemo: { $ne: true } };
+    if (['pending', 'refunded', 'not_applicable'].includes(req.query.refundStatus)) {
+      filter.refundStatus = req.query.refundStatus;
+    }
+    const search = (req.query.search || '').trim();
+    if (search) {
+      filter.$or = [
+        { 'customer.name': { $regex: search, $options: 'i' } },
+        { 'customer.phone': { $regex: search, $options: 'i' } },
+      ];
+      // A 24-hex fragment is treated as (part of) the order id.
+      if (/^[a-f0-9]{4,24}$/i.test(search)) {
+        filter.$or.push({ $expr: { $regexMatch: { input: { $toString: '$_id' }, regex: search, options: 'i' } } });
+      }
+    }
+
+    const [orders, total] = await Promise.all([
+      Order.find(filter).sort({ updatedAt: -1 }).skip(skip).limit(limit).populate('restaurantId', 'name'),
+      Order.countDocuments(filter),
+    ]);
+    res.json({ orders, total, page, pages: Math.ceil(total / limit) || 1 });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// PATCH /api/orders/:id/refund — mark a cancelled ONLINE order's refund done
+// (or reopen it). The refund itself happens outside the platform, directly
+// through Cashfree/Razorpay's own dashboard — this just records that it did.
+router.patch('/:id/refund', requireAdmin, async (req, res) => {
+  try {
+    const { refunded, note } = req.body || {};
+    if (typeof refunded !== 'boolean') {
+      return res.status(400).json({ message: 'refunded (boolean) is required' });
+    }
+
+    const order = await Order.findById(req.params.id).select('status source refundStatus');
+    if (!order) return res.status(404).json({ message: 'Order not found' });
+    if (order.status !== 'cancelled' || order.source !== 'ONLINE') {
+      return res.status(409).json({ message: 'Only a cancelled online order can have its refund tracked.' });
+    }
+
+    order.refundStatus = refunded ? 'refunded' : 'pending';
+    order.refundedAt = refunded ? new Date() : undefined;
+    if (note !== undefined) order.refundNote = note || undefined;
+    await order.save();
+
+    res.json({ order });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error' });
