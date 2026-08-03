@@ -27,9 +27,12 @@ const stringifyData = (data) =>
 async function sendToTokens(tokens, { title, body, image, data }) {
   const unique = [...new Set((tokens || []).filter(Boolean))];
   if (!unique.length) return { successCount: 0, failureCount: 0 };
+  // A missing credential is a deployment fault, not "delivered to zero people" —
+  // throwing makes an admin broadcast record it as Failed rather than quietly
+  // reporting success. Order pushes swallow it (they're fire-and-forget), so
+  // this can't break checkout either way.
   if (!isConfigured()) {
-    console.warn('[push] Firebase Admin not configured — skipping send');
-    return { successCount: 0, failureCount: 0 };
+    throw new Error('Firebase Admin is not configured — set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY.');
   }
 
   const messaging = getMessaging();
