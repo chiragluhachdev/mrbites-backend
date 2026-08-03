@@ -19,7 +19,7 @@ function startOrderScheduler(io) {
       const expiredOrders = await Order.find({
         status: 'pending',
         expiresAt: { $lt: now }
-      }).populate('restaurantId', 'name image');
+      }).populate('restaurantId', 'name');
 
       if (expiredOrders.length === 0) return;
 

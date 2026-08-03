@@ -76,7 +76,7 @@ router.patch('/:id/status', requireVendor, async (req, res) => {
       { _id: req.params.id, status: existing.status },
       update,
       { new: true }
-    ).populate('restaurantId', 'name image');
+    ).populate('restaurantId', 'name');
     if (!order) {
       return res.status(409).json({ message: 'That order was just updated elsewhere. Refresh and try again.' });
     }
@@ -189,23 +189,6 @@ const emitOrderCreated = (io, order) => {
 };
 
 /**
- * The picture shown in the expanded notification. A single-item order gets
- * that dish's own photo, which is the most recognisable thing we can show;
- * anything larger has no one dish to represent it, so it falls back to the
- * outlet's card image. Returns undefined when neither exists, in which case
- * the push simply goes out without a picture.
- */
-function orderPushImage(order) {
-  const items = order.items || [];
-  if (items.length === 1) {
-    const only = items[0];
-    const dish = only.image || only.itemId?.image || only.itemId?.imageUrl;
-    if (dish) return dish;
-  }
-  return order.restaurantId?.image || undefined;
-}
-
-/**
  * Sends the customer-facing push for an order's current stage. The wording
  * comes from the admin-editable templates on Settings (see
  * utils/orderPushCopy.js), which also decides whether this stage is switched
@@ -224,7 +207,6 @@ function pushOrderStatus(order, status) {
       await notifyByPhone(order.customer.phone, {
         title: copy.title,
         body: copy.body,
-        image: orderPushImage(order),
         data: { type: `order_${status}`, orderId: String(order._id), vendorId: String(restaurantId), screen: 'order' },
       });
     } catch (err) {
@@ -309,9 +291,7 @@ async function finalizeDraftToOrders(io, { gateway, gatewayOrderId, paymentId })
     }
   }
 
-  // `image` is needed by the order-confirmed push below, which falls back to
-  // the outlet's photo when the order has more than one item.
-  const orders = await Order.find({ [idField]: gatewayOrderId }).populate('restaurantId', 'name image');
+  const orders = await Order.find({ [idField]: gatewayOrderId }).populate('restaurantId', 'name');
 
   await OrderDraft.updateOne(
     { _id: claimed._id },
